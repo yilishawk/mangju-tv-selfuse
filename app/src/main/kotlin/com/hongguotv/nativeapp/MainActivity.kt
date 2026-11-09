@@ -1046,7 +1046,8 @@ class MainActivity : Activity() {
             nav.forEach { it.nextFocusDownId = typeButtons.getValue(library.contentType).id }
         }
         if (tab == 1) {
-            if (isPhone && (tvSearchOpen || query.isNotBlank())) {
+            // 手机恒用单列系统输入法；TV 的三栏遥控面板（含屏幕键盘入口）不创建。
+            if (isPhone) {
                 val panel =
                     PhoneSearchPanel(
                         this,
@@ -1128,22 +1129,27 @@ class MainActivity : Activity() {
                 lateinit var recent: TextView
                 recent = addButton(searchRow, "历史") { showSearchHistory(recent) }
                 recent.nextFocusUpId = input.nextFocusUpId
-                lateinit var phone: TextView
-                phone =
-                    addButton(searchRow, "手机输入") {
-                        (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager)
-                            .hideSoftInputFromWindow(input.windowToken, 0)
-                        tvTools.phoneInput(phone) { query, _ -> query?.let { runSearch(it) } }
-                    }
-                phone.nextFocusUpId = input.nextFocusUpId
-                val keyboard =
-                    addButton(searchRow, "屏幕键盘") {
-                            saveDiscoveryDraft()
-                            tvSearchOpen = true
-                            showCatalog()
+                if (isPhone) {
+                    // 手机自带软键盘，不再需要 TV 的伴机「手机输入」和「屏幕键盘」。
+                    searchActions.add(recent)
+                } else {
+                    lateinit var phone: TextView
+                    phone =
+                        addButton(searchRow, "手机输入") {
+                            (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager)
+                                .hideSoftInputFromWindow(input.windowToken, 0)
+                            tvTools.phoneInput(phone) { query, _ -> query?.let { runSearch(it) } }
                         }
-                        .apply { nextFocusUpId = input.nextFocusUpId }
-                searchActions.addAll(listOf(recent, phone, keyboard))
+                    phone.nextFocusUpId = input.nextFocusUpId
+                    val keyboard =
+                        addButton(searchRow, "屏幕键盘") {
+                                saveDiscoveryDraft()
+                                tvSearchOpen = true
+                                showCatalog()
+                            }
+                            .apply { nextFocusUpId = input.nextFocusUpId }
+                    searchActions.addAll(listOf(recent, phone, keyboard))
+                }
                 if (query.isNotBlank())
                     searchActions +=
                         addButton(searchRow, "返回分类") { returnToDiscovery() }
@@ -1873,17 +1879,20 @@ class MainActivity : Activity() {
         val requestQuery = query
         continuousKey = requestQuery
         val upper = searchInput ?: nav[tab]
+        // 手机一排 3 个大卡片；海报高度同步按 3 列算（见 CatalogPosterCard）。
+        val columns =
+            if (isPhone) 3
+            else if (tvSearchPanel != null) {
+                if (widthDp() < 800) 2 else if (widthDp() < 1200) 3 else 4
+            } else 6
         lateinit var browser: ContinuousCatalogView
         browser =
             ContinuousCatalogView(
                 this,
-                if (isPhone) 2
-                else if (tvSearchPanel != null) {
-                    if (widthDp() < 800) 2 else if (widthDp() < 1200) 3 else 4
-                } else 6,
+                columns,
                 upper,
                 { item, recycled ->
-                    val card = recycled as? CatalogPosterCard ?: CatalogPosterCard(this)
+                    val card = recycled as? CatalogPosterCard ?: CatalogPosterCard(this, columns)
                     card.show(item)
                     loadCover(card.image, item.cover)
                     card
@@ -2534,7 +2543,8 @@ class MainActivity : Activity() {
         invalidatePage()
         releaseCatalogViews()
         screen = "detail"
-        directPlayback = resume
+        // 手机点卡片直接进播放；directPlayback 让返回键回列表而不是回详情页。
+        directPlayback = resume || isPhone
         detail = null
         synopsisExpanded = false
         val body = base(series.title)
@@ -2566,7 +2576,9 @@ class MainActivity : Activity() {
                     )
                 episodeIndex = target.index
                 group = episodeIndex / 20
-                if (resume) playEpisode(target.index, target.position, autoplay = detailAutoplay)
+                // 手机形态跳过「详情 → 再点开始观看」，详情数据回来直接起播。
+                if (resume || (isPhone && detailAutoplay))
+                    playEpisode(target.index, target.position, autoplay = detailAutoplay)
                 else showDetail(false)
             },
             { problem ->
@@ -2973,6 +2985,8 @@ class MainActivity : Activity() {
         screen = "player"
         episodeIndex = selectedIndex
         group = episodeIndex / 20
+        // 复用播放页时 shell 不重建，选集条的高亮需要跟着切集刷新。
+        phonePlaybackShell?.refreshEpisodes()
         panel = false
         playError = false
         waitingForFirstFrame = true
@@ -3011,9 +3025,13 @@ class MainActivity : Activity() {
                 phoneChrome?.visibility = View.GONE
                 val shell =
                     PhonePlaybackShell(this).apply {
-                        onEpisodes = { playerView?.let { showEpisodePanel(it) } }
                         onNext = { playNextEpisode() }
                         onFullscreen = { setPhoneFullscreen(it) }
+                        // 选集常驻展开：点数字直接切集，不再需要「选集」弹窗。
+                        bindEpisodes(
+                            { detail?.episodes?.size ?: 0 },
+                            { episodeIndex },
+                        ) { index -> playEpisode(index) }
                     }
                 shell.playerHost.addView(view, FrameLayout.LayoutParams(-1, -1))
                 phoneSwipe =
@@ -4542,14 +4560,13 @@ class MainActivity : Activity() {
         }, selected = options.indexOf(library.maxQuality))
     }
 
-    // 手机形态：竖屏内嵌 16:9，点「全屏」才在运行时旋转；退出由返回键接管。
-    // Manifest 已声明 orientation|screenSize 的 configChanges，旋转不会重建 Activity。
+    // 手机形态：竖屏内嵌 16:9，点「全屏」只把播放器铺满当前竖屏，绝不强制旋转。
+    // 用户要横屏时自己转手机；Manifest 是 unspecified，configChanges 保证旋转不重建 Activity。
     private fun setPhoneFullscreen(on: Boolean) {
         if (!isPhone) return
         phonePlaybackShell?.setFullscreen(on)
-        requestedOrientation =
-            if (on) android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
-            else android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+        if (on) window.addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN)
+        else window.clearFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN)
         main.post { phonePlaybackShell?.playerHost?.requestLayout() }
     }
 
@@ -4738,7 +4755,10 @@ class MainActivity : Activity() {
         playerView = null
         phonePlaybackShell = null
         phoneSwipe = null
-        if (isPhone) requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+        if (isPhone) {
+            requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            window.clearFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN)
+        }
         player?.release()
         player = null
         playbackReady = false

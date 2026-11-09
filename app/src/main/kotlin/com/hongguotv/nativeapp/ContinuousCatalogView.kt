@@ -368,7 +368,8 @@ internal class ContinuousCatalogView(
     }
 }
 
-internal class CatalogPosterCard(context: Context) : LinearLayout(context) {
+internal class CatalogPosterCard(context: Context, private val columns: Int = 6) :
+    LinearLayout(context) {
     val image =
         ImageView(context).apply {
             scaleType = ImageView.ScaleType.FIT_CENTER
@@ -418,7 +419,11 @@ internal class CatalogPosterCard(context: Context) : LinearLayout(context) {
             (4 * density).toInt(),
             (9 * density).toInt(),
         )
-        val width = (resources.displayMetrics.widthPixels * .9f - 14 * density * 5) / 6
+        // 海报高度必须按实际列数算：写死 6 列时手机 2~3 列只变宽不变高，卡片看着又扁又小。
+        val safeColumns = columns.coerceAtLeast(1)
+        val width =
+            (resources.displayMetrics.widthPixels * .9f - 14 * density * (safeColumns - 1)) /
+                safeColumns
         preferredHeight = (width / TvStyle.POSTER_ASPECT).toInt()
         poster.addView(image, FrameLayout.LayoutParams(-1, -1))
         poster.addView(

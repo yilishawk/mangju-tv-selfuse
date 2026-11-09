@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 package com.hongguotv.nativeapp
 
-// 全屏横屏时挂在 PlayerView 上的上滑切集手势；竖屏内嵌播放不启用，交给页面滚动。
+// 全屏（竖屏铺满，或用户自己把手机转成横屏）时挂在 PlayerView 上的上滑切集手势；
+// 竖屏内嵌播放不启用，交给页面滚动。
 
 import android.annotation.SuppressLint
 import android.content.Context

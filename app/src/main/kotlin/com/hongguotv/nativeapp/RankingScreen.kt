@@ -21,6 +21,7 @@ internal class RankingScreen(
     private val more: (Series, View) -> Unit,
     private val load: (RankBoard, ((RankSnapshot?, String?) -> Unit)) -> Unit,
 ) : LinearLayout(activity) {
+    private val phone = activity.packageName.endsWith(".phone")
     private val controls = mutableListOf<TextView>()
     private val heading = label("热播排行榜", 25f)
     private val subtitle = label("", 12f, TvStyle.muted)
@@ -64,8 +65,15 @@ internal class RankingScreen(
         orientation = VERTICAL
         val title = row().apply { setPadding(0, dp(8), 0, dp(8)) }
         heading.typeface = Typeface.DEFAULT_BOLD
+        if (phone) heading.textSize = 20f
         title.addView(heading, params(0).apply { weight = 1f })
-        title.addView(label("方向键选剧  ·  确定看详情  ·  长按更多", 12f, TvStyle.muted))
+        title.addView(
+            label(
+                if (phone) "点卡片直接播放" else "方向键选剧  ·  确定看详情  ·  长按更多",
+                12f,
+                TvStyle.muted,
+            )
+        )
         addView(title)
         val bar = row()
         RankBoard.entries.forEach { board ->
@@ -92,7 +100,9 @@ internal class RankingScreen(
             )
             controls += control
         }
-        bar.addView(View(activity), params(0, 1).apply { weight = 1f })
+        // 手机把榜单切换条放进横向滚动，固定 92dp 的按钮不再挤出屏幕；
+        // 这个占位在横向滚动里没有可分配的剩余宽度，只在 TV 形态保留。
+        if (!phone) bar.addView(View(activity), params(0, 1).apply { weight = 1f })
         filterButton = button("筛选题材") { chooseTopic() }.apply { nextFocusUpId = nav[2].id }
         refreshButton = button("刷新") { maybeRefresh(state.board, force = true) }
             .apply { nextFocusUpId = nav[2].id }
@@ -105,7 +115,15 @@ internal class RankingScreen(
             v.nextFocusRightId = controls.getOrNull(i + 1)?.id ?: v.id
         }
         nav.forEach { it.nextFocusDownId = controls[state.board.ordinal].id }
-        addView(bar)
+        if (phone)
+            addView(
+                HorizontalScrollView(activity).apply {
+                    isHorizontalScrollBarEnabled = false
+                    addView(bar, FrameLayout.LayoutParams(-2, -2))
+                },
+                params(-1, -2),
+            )
+        else addView(bar)
         subtitle.setPadding(0, dp(9), 0, dp(9))
         subtitle.maxLines = 2
         addView(subtitle)
@@ -219,13 +237,14 @@ internal class RankingScreen(
             return
         }
         val saved = state.selectedId
+        val columns = if (phone) 3 else 6
         val list =
             ContinuousCatalogView(
                 activity,
-                6,
+                columns,
                 controls[state.board.ordinal],
                 { item, recycled ->
-                    val card = recycled as? CatalogPosterCard ?: CatalogPosterCard(activity)
+                    val card = recycled as? CatalogPosterCard ?: CatalogPosterCard(activity, columns)
                     card.show(item, snapshot?.ranking?.positions?.get(item.id))
                     cover(card.image, item.cover)
                     card

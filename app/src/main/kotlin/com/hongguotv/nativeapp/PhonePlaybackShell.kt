@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 package com.hongguotv.nativeapp
 
-// 手机播放外壳：竖屏时上方 16:9 播放器、下方信息区；全屏时隐藏信息区并铺满播放器。
+// 手机播放外壳：竖屏时上方 16:9 播放器、下方信息区（选集常驻展开）；
+// 点「全屏」只把播放器铺满当前竖屏，绝不强制旋转，横屏交给用户自己转手机。
 
 import android.content.Context
 import android.graphics.Color
@@ -9,17 +10,18 @@ import android.view.Gravity
 import android.view.View
 import android.widget.FrameLayout
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 
 /** Portrait playback shell. The host keeps the existing PlayerView instance untouched. */
 internal class PhonePlaybackShell(context: Context) : LinearLayout(context) {
     val playerHost = FrameLayout(context)
     val infoPanel = LinearLayout(context)
+    private val episodeStrip = PhoneEpisodeStrip(context)
     private val swipeHint = TextView(context)
     private val portraitHeight = resources.displayMetrics.widthPixels * 9 / 16
     private var fullscreen = false
 
-    var onEpisodes: (() -> Unit)? = null
     var onNext: (() -> Unit)? = null
     var onFullscreen: ((Boolean) -> Unit)? = null
 
@@ -56,7 +58,7 @@ internal class PhonePlaybackShell(context: Context) : LinearLayout(context) {
         }
         infoPanel.addView(
             TextView(context).apply {
-                text = "播放中 · 点全屏可横屏，全屏时上滑切换下一集"
+                text = "播放中 · 全屏时上滑切换下一集"
                 textSize = 12f
                 setTextColor(TvStyle.muted)
             },
@@ -64,7 +66,6 @@ internal class PhonePlaybackShell(context: Context) : LinearLayout(context) {
         )
         val actions = LinearLayout(context).apply { orientation = HORIZONTAL }
         listOf(
-            "选集" to { onEpisodes?.invoke() },
             "下一集" to { onNext?.invoke() },
             "全屏" to { onFullscreen?.invoke(!fullscreen) },
         ).forEach { (label, click) ->
@@ -75,8 +76,21 @@ internal class PhonePlaybackShell(context: Context) : LinearLayout(context) {
             )
         }
         infoPanel.addView(actions, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) })
+        infoPanel.addView(
+            ScrollView(context).apply {
+                isVerticalScrollBarEnabled = false
+                addView(episodeStrip, FrameLayout.LayoutParams(-1, -2))
+            },
+            LayoutParams(-1, 0, 1f).apply { topMargin = dp(6) },
+        )
         addView(infoPanel, LayoutParams(-1, 0, 1f))
     }
+
+    /** Episodes stay expanded; clicking a number switches immediately, no dialog. */
+    fun bindEpisodes(count: () -> Int, current: () -> Int, select: (Int) -> Unit) =
+        episodeStrip.bind(count, current, select)
+
+    fun refreshEpisodes() = episodeStrip.refresh()
 
     fun setFullscreen(on: Boolean) {
         fullscreen = on

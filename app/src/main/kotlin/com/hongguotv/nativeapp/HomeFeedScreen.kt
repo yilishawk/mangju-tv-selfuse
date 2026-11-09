@@ -63,6 +63,8 @@ internal class HomeFeedScreen(
     private var lastPlaybackError: androidx.media3.common.PlaybackException? = null
     private var healTarget: String? = null
     private var healAttempts = 0
+    // 手机形态按包名判定：用户可能自己横屏，宽度会变，不能用 screenWidthDp。
+    private val phone = activity.packageName.endsWith(".phone")
     private val stage = FrameLayout(activity)
     private val title = label("发现下一部好剧", 25f)
     private val meta = label("第一集试播", 13f, TvStyle.accent)
@@ -151,7 +153,11 @@ internal class HomeFeedScreen(
             b.nextFocusRightId = typeChoices.getOrNull(i + 1)?.id ?: b.id
         }
         addView(types, lp(-1, dp(48)))
-        val content = LinearLayout(activity)
+        // 手机改成上下分栏：上方 16:9 试播，下方文字信息；TV 保持左右 2.2 : 1。
+        val content =
+            LinearLayout(activity).apply {
+                orientation = if (phone) VERTICAL else HORIZONTAL
+            }
         stage.isFocusable = true
         stage.isFocusableInTouchMode = true
         stage.isClickable = true
@@ -177,33 +183,39 @@ internal class HomeFeedScreen(
         )
         content.addView(
             stage,
-            lp(0, -1).apply {
-                weight = 2.2f
-                rightMargin = dp(22)
-            },
+            if (phone) lp(-1, (activity.resources.displayMetrics.widthPixels * 9f / 16f).toInt())
+            else
+                lp(0, -1).apply {
+                    weight = 2.2f
+                    rightMargin = dp(22)
+                },
         )
         val info =
             LinearLayout(activity).apply {
                 orientation = VERTICAL
-                setPadding(0, dp(14), 0, dp(10))
+                setPadding(0, dp(if (phone) 8 else 14), 0, dp(10))
             }
+        if (phone) title.textSize = 20f
         title.typeface = Typeface.DEFAULT_BOLD
         title.maxLines = 3
         title.ellipsize = TextUtils.TruncateAt.END
         info.addView(title)
         meta.maxLines = 2
-        meta.setPadding(0, dp(12), 0, dp(12))
+        meta.setPadding(0, dp(if (phone) 6 else 12), 0, dp(if (phone) 6 else 12))
         info.addView(meta)
-        intro.maxLines = 6
+        intro.maxLines = if (phone) 2 else 6
         intro.ellipsize = TextUtils.TruncateAt.END
         info.addView(intro)
-        info.addView(Space(activity), lp(1, 0).apply { weight = 1f })
+        if (!phone) info.addView(Space(activity), lp(1, 0).apply { weight = 1f })
         info.addView(
-            label("↑ ↓  换一部\n确定  打开操作\n返回  顶部导航", 13f, TvStyle.muted).apply {
-                setLineSpacing(dp(6).toFloat(), 1f)
-            }
+            label(
+                if (phone) "点画面看操作  ·  点「观看全集」直接播放"
+                else "↑ ↓  换一部\n确定  打开操作\n返回  顶部导航",
+                13f,
+                TvStyle.muted,
+            ).apply { setLineSpacing(dp(6).toFloat(), 1f) }
         )
-        content.addView(info, lp(0, -1).apply { weight = 1f })
+        content.addView(info, if (phone) lp(-1, -2) else lp(0, -1).apply { weight = 1f })
         addView(content, lp(-1, 0).apply { weight = 1f })
         pauseButton = button("暂停试播") { toggle() }
         watchButton =
