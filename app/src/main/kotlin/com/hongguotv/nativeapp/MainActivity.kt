@@ -138,6 +138,14 @@ class MainActivity : Activity() {
     private var searchSuggestions: SearchSuggestionsView? = null
     private var tvSearchPanel: TvSearchPanel? = null
     private var tvSearchOpen = false
+    // 手机形态判据用包名而非屏幕宽度：横屏后宽度会变；TV 版一律 false。
+    // by lazy 是必须的：Activity 字段初始化时 mBase 尚未 attach，直接取 packageName 会空指针。
+    private val isPhone by lazy { packageName.endsWith(".phone") }
+    private var phoneChrome: PhoneChrome? = null
+    private var phoneMyTabs: PhoneMyTabs? = null
+    private var phonePlaybackShell: PhonePlaybackShell? = null
+    private var phoneSearchPanel: PhoneSearchPanel? = null
+    private var phoneSwipe: PhoneSwipeGesture? = null
     private val discoveryBrowser = DiscoveryBrowserState()
     private var discoveryScreen: DiscoveryScreen? = null
     private lateinit var tvTools: TvTools
@@ -432,7 +440,18 @@ class MainActivity : Activity() {
         artwork = ArtworkLoader(this)
         tvTools = TvTools(this)
         root = FrameLayout(this).apply { background = TvVisual.backdrop(this@MainActivity) }
-        setContentView(root)
+        if (isPhone) {
+            val shell = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+            shell.addView(root, LinearLayout.LayoutParams(-1, 0, 1f))
+            val chrome =
+                PhoneChrome(this, listOf("首页", "找剧", "榜单", "我的")) { index ->
+                    switchTab(if (index <= 2) index else 3)
+                }
+            phoneChrome = chrome
+            chrome.select(0)
+            shell.addView(chrome, LinearLayout.LayoutParams(-1, -2))
+            setContentView(shell)
+        } else setContentView(root)
         CodecCapabilities.init(this)
         CodecCapabilities.logDeviceCapabilities()
         cloudAccount =
@@ -615,6 +634,7 @@ class MainActivity : Activity() {
         searchSuggestions?.close()
         searchSuggestions = null
         tvSearchPanel = null
+        phoneSearchPanel = null
         discoveryScreen?.close()
         discoveryScreen = null
         continuousCatalog?.let { view ->
@@ -710,6 +730,7 @@ class MainActivity : Activity() {
         tabState[tab] = CatalogState(page, catalog, hasMore, ranking)
         tabFocus[tab] = catalogFocus
         tab = next
+        phoneChrome?.select(if (next <= 2) next else 3)
         val saved = tabState[next]
         page = saved?.page ?: 1
         catalog = saved?.items ?: emptyList()
@@ -898,6 +919,30 @@ class MainActivity : Activity() {
             nav += item
         }
         container.addView(top)
+        if (isPhone) {
+            // 7 个顶 tab 仍要创建（nav[] 有 30+ 处引用），只是不占布局；底部 4 tab 接管导航。
+            top.visibility = View.GONE
+            phoneChrome?.visibility = View.VISIBLE
+            val phoneTop = row()
+            phoneTop.addView(
+                text("漫剧", 19f).apply { setTypeface(null, Typeface.BOLD) },
+                lp(0, dp(40)).apply { weight = 1f },
+            )
+            phoneTop.addView(
+                text(
+                    listOf("首页", "找剧", "排行榜", "收藏", "观看历史", "账户预约", "设置")[tab],
+                    13f,
+                    muted,
+                )
+            )
+            container.addView(phoneTop)
+            if (tab >= 3) {
+                val myTabs = PhoneMyTabs(this) { switchTab(it) }
+                myTabs.select(tab)
+                phoneMyTabs = myTabs
+                container.addView(myTabs, lp(-1, -2))
+            }
+        }
         container.addView(
             View(this).apply { setBackgroundColor(TvStyle.outline) },
             lp(-1, dp(1)).apply { bottomMargin = dp(6) },
@@ -1001,7 +1046,28 @@ class MainActivity : Activity() {
             nav.forEach { it.nextFocusDownId = typeButtons.getValue(library.contentType).id }
         }
         if (tab == 1) {
-            if (tvSearchOpen || query.isNotBlank()) {
+            if (isPhone && (tvSearchOpen || query.isNotBlank())) {
+                val panel =
+                    PhoneSearchPanel(
+                        this,
+                        searchDraft ?: query,
+                        library.searches().map { it.query },
+                        ::runSearch,
+                        ::returnToDiscovery,
+                    )
+                phoneSearchPanel = panel
+                tvSearchPanel = null
+                searchInput = panel.input
+                searchButton = panel.searchButton
+                searchSuggestions = null
+                panel.resultEntry = { continuousCatalog?.grid?.takeIf { catalog.isNotEmpty() } }
+                container.addView(panel, lp(-1, 0).apply { weight = 1f })
+                if (query.isBlank()) {
+                    message(panel.results, "输入关键词搜索剧集，或从最近搜索里挑一个")
+                    panel.entry().requestFocus()
+                    return
+                }
+            } else if (tvSearchOpen || query.isNotBlank()) {
                 val panel =
                     TvSearchPanel(
                         this,
@@ -1278,7 +1344,7 @@ class MainActivity : Activity() {
         }
         val body = column()
         catalogBody = body
-        (tvSearchPanel?.results ?: container).addView(body, lp(-1, 0).apply { weight = 1f })
+        (phoneSearchPanel?.results ?: tvSearchPanel?.results ?: container).addView(body, lp(-1, 0).apply { weight = 1f })
         if (localCatalog()) {
             catalog = localItems()
             ranking = null
@@ -1289,7 +1355,8 @@ class MainActivity : Activity() {
             if (tab == 0) catalogGrid(body, focusNav, focusType, loading = true)
             else {
                 message(body, "正在加载…")
-                if (tvSearchPanel != null) tvSearchPanel?.entry()?.requestFocus()
+                if (phoneSearchPanel != null) phoneSearchPanel?.entry()?.requestFocus()
+                else if (tvSearchPanel != null) tvSearchPanel?.entry()?.requestFocus()
                 else if (focusType) typeButtons[library.contentType]?.requestFocus()
                 else nav[tab].requestFocus()
             }
@@ -1330,7 +1397,7 @@ class MainActivity : Activity() {
                         val keepType = typeButtons.values.any { it.hasFocus() }
                         val keepInput = searchInput?.hasFocus() == true
                         val keepSuggestion =
-                            tvSearchPanel?.findFocus() ?: searchSuggestions?.findFocus()
+                            phoneSearchPanel?.findFocus() ?: tvSearchPanel?.findFocus() ?: searchSuggestions?.findFocus()
                         rankSubtitle?.text =
                             ranking?.updatedText?.ifBlank { "来源：红果漫剧热播榜" } ?: "来源：红果漫剧热播榜"
                         body.removeAllViews()
@@ -1478,7 +1545,7 @@ class MainActivity : Activity() {
             return
         }
         val cards = mutableListOf<View>()
-        val count = 6
+        val count = if (isPhone) 3 else 6
         val gap = dp(14)
         val width =
             ((resources.displayMetrics.widthPixels * .9f - gap * (count - 1)) / count).toInt()
@@ -1810,7 +1877,8 @@ class MainActivity : Activity() {
         browser =
             ContinuousCatalogView(
                 this,
-                if (tvSearchPanel != null) {
+                if (isPhone) 2
+                else if (tvSearchPanel != null) {
                     if (widthDp() < 800) 2 else if (widthDp() < 1200) 3 else 4
                 } else 6,
                 upper,
@@ -2939,7 +3007,25 @@ class MainActivity : Activity() {
                     setShowBuffering(PlayerView.SHOW_BUFFERING_ALWAYS)
                 }
             playerView = view
-            root.addView(view, FrameLayout.LayoutParams(-1, -1))
+            if (isPhone) {
+                phoneChrome?.visibility = View.GONE
+                val shell =
+                    PhonePlaybackShell(this).apply {
+                        onEpisodes = { playerView?.let { showEpisodePanel(it) } }
+                        onNext = { playNextEpisode() }
+                        onFullscreen = { setPhoneFullscreen(it) }
+                    }
+                shell.playerHost.addView(view, FrameLayout.LayoutParams(-1, -1))
+                phoneSwipe =
+                    PhoneSwipeGesture(
+                        this,
+                        { shell.isFullscreen() },
+                        { playNextEpisode() },
+                        { shell.showHint(it) },
+                    ).also { gesture -> view.setOnTouchListener(gesture) }
+                phonePlaybackShell = shell
+                root.addView(shell, FrameLayout.LayoutParams(-1, -1))
+            } else root.addView(view, FrameLayout.LayoutParams(-1, -1))
             social.attach(root)
             playbackClock = TextClock(this).apply {
                 format12Hour = "HH:mm"
@@ -2996,7 +3082,9 @@ class MainActivity : Activity() {
                     visibility = View.GONE
                 }
             hud.addView(controls)
-            root.addView(
+            // 手机竖屏时 HUD 叠在 16:9 画面内；全屏时 playerHost 铺满，HUD 自然落到底部。
+            val hudHost: FrameLayout = if (isPhone) phonePlaybackShell?.playerHost ?: root else root
+            hudHost.addView(
                 ScrollView(this).apply {
                     isVerticalScrollBarEnabled = false
                     addView(hud)
@@ -4454,6 +4542,24 @@ class MainActivity : Activity() {
         }, selected = options.indexOf(library.maxQuality))
     }
 
+    // 手机形态：竖屏内嵌 16:9，点「全屏」才在运行时旋转；退出由返回键接管。
+    // Manifest 已声明 orientation|screenSize 的 configChanges，旋转不会重建 Activity。
+    private fun setPhoneFullscreen(on: Boolean) {
+        if (!isPhone) return
+        phonePlaybackShell?.setFullscreen(on)
+        requestedOrientation =
+            if (on) android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+            else android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+        main.post { phonePlaybackShell?.playerHost?.requestLayout() }
+    }
+
+    // 手动切集复用既有 playEpisode 与下一集预加载，不走 automaticNext 的连播统计语义。
+    private fun playNextEpisode() {
+        val last = detail?.episodes?.lastIndex ?: 0
+        if (episodeIndex < last) playEpisode(episodeIndex + 1)
+        else Toast.makeText(this, "已经是最后一集", Toast.LENGTH_SHORT).show()
+    }
+
     private fun showEpisodePanel(anchor: View) {
         val data = detail ?: return
         if (episodePanel != null) return
@@ -4493,6 +4599,7 @@ class MainActivity : Activity() {
                         data.episodes.indexOf(it.episodeId).takeIf { n -> n >= 0 }
                     },
                 lastCompleted = library.progress(data.series.id)?.completed == true,
+                phone = isPhone,
             )
         episodePanel = next
         next.show()
@@ -4627,7 +4734,11 @@ class MainActivity : Activity() {
         video?.close()
         video = null
         playerView?.player = null
+        playerView?.setOnTouchListener(null)
         playerView = null
+        phonePlaybackShell = null
+        phoneSwipe = null
+        if (isPhone) requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
         player?.release()
         player = null
         playbackReady = false
@@ -4703,14 +4814,23 @@ class MainActivity : Activity() {
     }
 
     @Deprecated("TV remote back is handled through the activity")
-    override fun onBackPressed() = goBack()
+    override fun onBackPressed() {
+        if (isPhone && phonePlaybackShell?.isFullscreen() == true) {
+            setPhoneFullscreen(false)
+            return
+        }
+        goBack()
+    }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         if (screen == "player") {
             if (panel && !playError && event.action == KeyEvent.ACTION_DOWN) showHud()
             val key = event.keyCode
             if (key == KeyEvent.KEYCODE_BACK) {
-                if (event.action == KeyEvent.ACTION_UP) goBack()
+                if (event.action == KeyEvent.ACTION_UP) {
+                    if (isPhone && phonePlaybackShell?.isFullscreen() == true) setPhoneFullscreen(false)
+                    else goBack()
+                }
                 return true
             }
             if (

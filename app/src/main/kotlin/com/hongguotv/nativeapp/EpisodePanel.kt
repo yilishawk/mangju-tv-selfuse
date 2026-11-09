@@ -22,6 +22,7 @@ class EpisodePanel(
     private val closed: () -> Unit,
     private val lastWatched: Int? = null,
     private val lastCompleted: Boolean = false,
+    private val phone: Boolean = false,
 ) {
     private val dialog = Dialog(activity)
     private var group = current / 20
@@ -59,15 +60,21 @@ class EpisodePanel(
         dialog.show()
         dialog.window?.apply {
             setBackgroundDrawableResource(android.R.color.transparent)
-            setGravity(Gravity.END or Gravity.CENTER_VERTICAL)
-            attributes =
-                attributes.apply {
-                    x = (activity.resources.displayMetrics.widthPixels * .05f).toInt()
-                }
-            setLayout(
-                minOf(dp(520), (activity.resources.displayMetrics.widthPixels * .8f).toInt()),
-                (activity.resources.displayMetrics.heightPixels * .9f).toInt(),
-            )
+            if (phone) {
+                // 手机：底部弹层宫格，替代 TV 的右侧抽屉。
+                setGravity(Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL)
+                setLayout(-1, (activity.resources.displayMetrics.heightPixels * .68f).toInt())
+            } else {
+                setGravity(Gravity.END or Gravity.CENTER_VERTICAL)
+                attributes =
+                    attributes.apply {
+                        x = (activity.resources.displayMetrics.widthPixels * .05f).toInt()
+                    }
+                setLayout(
+                    minOf(dp(520), (activity.resources.displayMetrics.widthPixels * .8f).toInt()),
+                    (activity.resources.displayMetrics.heightPixels * .9f).toInt(),
+                )
+            }
         }
     }
 
@@ -144,12 +151,16 @@ class EpisodePanel(
             indexes.forEach { index ->
                 val cell =
                     button(
-                        "${index+1}" +
-                            when {
-                                index == current -> " · 当前"
-                                index == lastWatched -> if (lastCompleted) " · 已看" else " · 上次"
-                                else -> ""
-                            },
+                        if (phone) {
+                            "${index+1}"
+                        } else {
+                            "${index+1}" +
+                                when {
+                                    index == current -> " · 当前"
+                                    index == lastWatched -> if (lastCompleted) " · 已看" else " · 上次"
+                                    else -> ""
+                                }
+                        },
                         index == current,
                     ) {
                         select(index)
