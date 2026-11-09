@@ -36,6 +36,33 @@ jobs:
           java-version: '17'
           cache: gradle
 
+      - name: 准备 Gradle 8.14.3（镜像直连，绕开 GitHub Releases 504）
+        shell: bash
+        run: |
+          set -e
+          # services.gradle.org / downloads.gradle.org 都 307 跳到
+          # github.com/gradle/gradle-distributions/releases，该通道当前稳定 504。
+          # 直接用不跳转的镜像下载发行包并解压，避免改 wrapper 的官方域名校验。
+          GRADLE_ZIP="$RUNNER_TEMP/gradle-8.14.3-bin.zip"
+          for MIRROR in \
+            "https://mirrors.cloud.tencent.com/gradle/gradle-8.14.3-bin.zip" \
+            "https://mirrors.huaweicloud.com/gradle/gradle-8.14.3-bin.zip" \
+            "https://repo.huaweicloud.com/gradle/gradle-8.14.3-bin.zip" \
+            "https://services.gradle.org/distributions/gradle-8.14.3-bin.zip"; do
+            echo "尝试镜像: $MIRROR"
+            if curl -fsSL --connect-timeout 15 --max-time 300 -o "$GRADLE_ZIP" "$MIRROR"; then
+              echo "下载成功: $MIRROR"
+              break
+            fi
+            echo "该源失败，换下一个"
+          done
+          [ -s "$GRADLE_ZIP" ] || { echo "所有 Gradle 下载源均失败"; exit 1; }
+          unzip -q -o "$GRADLE_ZIP" -d "$RUNNER_TEMP/gradle-dist"
+          GRADLE_BIN="$RUNNER_TEMP/gradle-dist/gradle-8.14.3/bin/gradle"
+          chmod +x "$GRADLE_BIN"
+          "$GRADLE_BIN" --version | head -8
+          echo "GRADLE_BIN=$GRADLE_BIN" >> "$GITHUB_ENV"
+
       - name: 安装 Android SDK Platform 36 / Build Tools 36
         shell: bash
         run: |
@@ -76,10 +103,18 @@ jobs:
         shell: bash
         run: |
           set -e
-          chmod +x gradlew
-          ./gradlew assembleDebug --no-daemon --console=plain --stacktrace
-          if [ -f keystore.properties ]; then
-            ./gradlew assembleRelease --no-daemon --console=plain --stacktrace
+          run_build() {
+            "$GRADLE_BIN" assembleDebug --no-daemon --console=plain --stacktrace
+            if [ -f keystore.properties ]; then
+              "$GRADLE_BIN" assembleRelease --no-daemon --console=plain --stacktrace
+            fi
+          }
+          # Kotlin 2.1.20 的 compiler embeddable 也走 GitHub Releases，偶发 504；
+          # 首次失败时依赖多半已落盘，重试一次通常即可通过。
+          if ! run_build; then
+            echo "::warning::首次构建失败，20 秒后重试一次"
+            sleep 20
+            run_build
           fi
           echo "==== 产物清单 ===="
           find app/build/outputs/apk -name '*.apk' -printf '%p  %s bytes\n'
