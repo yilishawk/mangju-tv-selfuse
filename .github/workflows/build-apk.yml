@@ -60,7 +60,9 @@ jobs:
           if [ -n "$KEYSTORE_B64" ]; then
             printf '%s' "$KEYSTORE_B64" | base64 -d > ours.jks
             {
-              echo "storeFile=ours.jks"
+              # app/build.gradle.kts 用 app 模块的 file() 解析 storeFile，
+              # 因此这里要写回仓库根目录的 jks（../ours.jks）
+              echo "storeFile=../ours.jks"
               echo "storePassword=$KS_STORE_PASS"
               echo "keyAlias=$KS_KEY_ALIAS"
               echo "keyPassword=$KS_KEY_PASS"
