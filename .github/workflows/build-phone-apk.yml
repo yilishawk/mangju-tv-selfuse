@@ -1,0 +1,155 @@
+name: 构建漫剧手机版 APK
+
+# 与 TV 版共用同一份源码，仅在 CI 工作区里临时改形态：
+#   1) 允许横竖屏（TV 版是 android:screenOrientation="landscape"）
+#   2) 独立包名 com.kaige.mangju.phone（可与 TV 版共存、同签名覆盖升级）
+#   3) 应用名去掉 "TV"
+# 仓库源码、TV 版 workflow、TV 版 Release 产物均不受影响。
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: '打包后发布 Release'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mangju-phone-build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+
+      - name: 准备 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: 准备 Gradle 8.14.3（镜像直连，绕开 GitHub Releases 504）
+        shell: bash
+        run: |
+          set -e
+          GRADLE_ZIP="$RUNNER_TEMP/gradle-8.14.3-bin.zip"
+          for MIRROR in \
+            "https://mirrors.cloud.tencent.com/gradle/gradle-8.14.3-bin.zip" \
+            "https://mirrors.huaweicloud.com/gradle/gradle-8.14.3-bin.zip" \
+            "https://repo.huaweicloud.com/gradle/gradle-8.14.3-bin.zip" \
+            "https://services.gradle.org/distributions/gradle-8.14.3-bin.zip"; do
+            echo "尝试镜像: $MIRROR"
+            if curl -fsSL --connect-timeout 15 --max-time 300 -o "$GRADLE_ZIP" "$MIRROR"; then
+              echo "下载成功: $MIRROR"
+              break
+            fi
+            echo "该源失败，换下一个"
+          done
+          [ -s "$GRADLE_ZIP" ] || { echo "所有 Gradle 下载源均失败"; exit 1; }
+          unzip -q -o "$GRADLE_ZIP" -d "$RUNNER_TEMP/gradle-dist"
+          GRADLE_BIN="$RUNNER_TEMP/gradle-dist/gradle-8.14.3/bin/gradle"
+          chmod +x "$GRADLE_BIN"
+          "$GRADLE_BIN" --version | head -8
+          echo "GRADLE_BIN=$GRADLE_BIN" >> "$GITHUB_ENV"
+
+      - name: 安装 Android SDK Platform 36 / Build Tools 36
+        shell: bash
+        run: |
+          set -e
+          SDKMGR="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMGR" ]; then SDKMGR="$(command -v sdkmanager)"; fi
+          yes | "$SDKMGR" --licenses >/dev/null 2>&1 || true
+          "$SDKMGR" "platforms;android-36" "build-tools;36.0.0" "platform-tools"
+
+      - name: 注入 release 签名（仅当配置了 Secrets）
+        shell: bash
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          KS_STORE_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          KS_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KS_KEY_PASS: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            printf '%s' "$KEYSTORE_B64" | base64 -d > ours.jks
+            {
+              echo "storeFile=../ours.jks"
+              echo "storePassword=$KS_STORE_PASS"
+              echo "keyAlias=$KS_KEY_ALIAS"
+              echo "keyPassword=$KS_KEY_PASS"
+            } > keystore.properties
+            echo "release 签名已注入"
+          else
+            echo "::notice::未配置签名 Secrets，本次只产出 debug 包"
+          fi
+
+      - name: 临时改为手机版形态（仅 CI 工作区）
+        shell: bash
+        run: |
+          set -e
+          MANIFEST=app/src/main/AndroidManifest.xml
+          sed -i 's/android:screenOrientation="landscape"/android:screenOrientation="unspecified"/' "$MANIFEST"
+          sed -i 's/android:label="漫剧 TV"/android:label="漫剧"/' "$MANIFEST"
+          sed -i 's/applicationId = "com.kaige.mangju.tv"/applicationId = "com.kaige.mangju.phone"/' app/build.gradle.kts
+          sed -i 's/"com.kaige.mangju.tv"/"com.kaige.mangju.phone"/' \
+                core/src/main/kotlin/com/hongguotv/core/AppUpdates.kt
+          find app/src/main core/src/main \( -name '*.kt' -o -name '*.xml' \) -print0 \
+            | xargs -0 sed -i 's/漫剧 TV/漫剧/g'
+          echo "---- 替换结果校验 ----"
+          grep -q 'screenOrientation="unspecified"' "$MANIFEST" || { echo "方向替换失败"; exit 1; }
+          grep -q 'android:label="漫剧"' "$MANIFEST" || { echo "应用名替换失败"; exit 1; }
+          grep -q 'com.kaige.mangju.phone' app/build.gradle.kts || { echo "包名替换失败"; exit 1; }
+          grep -nE 'screenOrientation|android:label' "$MANIFEST"
+          grep -n 'applicationId' app/build.gradle.kts
+
+      - name: 编译手机版 APK
+        shell: bash
+        run: |
+          set -e
+          run_build() {
+            if [ -f keystore.properties ]; then
+              "$GRADLE_BIN" assembleRelease --no-daemon --console=plain --stacktrace
+            else
+              "$GRADLE_BIN" assembleDebug --no-daemon --console=plain --stacktrace
+            fi
+          }
+          # Kotlin compiler embeddable 走 GitHub Releases，偶发 504，失败重试一次
+          if ! run_build; then
+            echo "::warning::首次构建失败，20 秒后重试一次"
+            sleep 20
+            run_build
+          fi
+          echo "==== 产物清单 ===="
+          find app/build/outputs/apk -name '*.apk' -printf '%p  %s bytes\n'
+          mkdir -p dist
+          find app/build/outputs/apk -name '*.apk' -exec cp {} dist/ \;
+          ls -la dist
+
+      - name: 上传手机版 APK 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: mangju-phone-apk
+          path: dist/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 发布 Release
+        if: ${{ inputs.publish == true }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          TAG="phone-v1.0.${{ github.run_number }}"
+          gh release create "$TAG" dist/*.apk \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "漫剧 手机版 $TAG" \
+            --notes "手机版自用分支自动构建。与 TV 版同源码、同签名、不同包名（com.kaige.mangju.phone），可与 TV 版共存；仓库源码未被修改，形态只在本次 CI 工作区临时替换。基于 tsukiyo-zero/hongguoTV（GPL-3.0-only），完整对应源码即本仓库本次提交。非红果官方客户端。"
+          echo "已发布 Release：$TAG"
