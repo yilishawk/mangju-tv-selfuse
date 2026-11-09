@@ -1,0 +1,23 @@
+# 本机 SDK 路径（CI 用 ANDROID_HOME，不入库）
+local.properties
+
+# Gradle / 构建产物
+.gradle/
+**/build/
+.externalNativeBuild/
+.cxx/
+captures/
+
+# 签名凭据：绝不入库，CI 通过 Actions Secrets 注入
+*.jks
+*.keystore
+keystore.properties
+
+# APK 产物只走 Actions Artifact，不进 git
+*.apk
+
+# 编辑器 / 系统
+.idea/
+*.iml
+.DS_Store
+Thumbs.db

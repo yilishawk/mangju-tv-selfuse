@@ -1,0 +1,114 @@
+name: 构建漫剧 TV 自用版 APK
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths-ignore:
+      - '**.md'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: '打包后发布 Release'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mangju-tv-build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+
+      - name: 准备 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: 安装 Android SDK Platform 36 / Build Tools 36
+        shell: bash
+        run: |
+          set -e
+          SDKMGR="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMGR" ]; then
+            SDKMGR="$(command -v sdkmanager)"
+          fi
+          yes | "$SDKMGR" --licenses >/dev/null 2>&1 || true
+          "$SDKMGR" "platforms;android-36" "build-tools;36.0.0" "platform-tools"
+          echo "已安装："
+          ls -1 "$ANDROID_HOME/platforms" | grep 'android-36' || true
+
+      - name: 注入 release 签名（仅当配置了 Secrets）
+        shell: bash
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          KS_STORE_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          KS_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KS_KEY_PASS: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            printf '%s' "$KEYSTORE_B64" | base64 -d > ours.jks
+            {
+              echo "storeFile=ours.jks"
+              echo "storePassword=$KS_STORE_PASS"
+              echo "keyAlias=$KS_KEY_ALIAS"
+              echo "keyPassword=$KS_KEY_PASS"
+            } > keystore.properties
+            echo "release 签名已注入，本次将产出 release 包"
+          else
+            echo "::notice::未配置 KEYSTORE_BASE64 等 Secrets，本次只产出 debug 包（可直接安装）"
+          fi
+
+      - name: 编译 APK
+        shell: bash
+        run: |
+          set -e
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon --console=plain --stacktrace
+          if [ -f keystore.properties ]; then
+            ./gradlew assembleRelease --no-daemon --console=plain --stacktrace
+          fi
+          echo "==== 产物清单 ===="
+          find app/build/outputs/apk -name '*.apk' -printf '%p  %s bytes\n'
+
+      - name: 上传 APK 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: mangju-tv-apk
+          path: app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 发布 Release
+        if: ${{ inputs.publish == true || startsWith(github.ref, 'refs/tags/v') }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          TAG="v1.0.${{ github.run_number }}"
+          mkdir -p dist
+          found=0
+          while IFS= read -r f; do
+            found=1
+            base="$(basename "$f")"
+            cp "$f" "dist/mangju-tv-$TAG-${base#app-}"
+          done < <(find app/build/outputs/apk -name '*.apk' | sort)
+          [ "$found" -eq 1 ] || { echo "没有 APK 产物"; exit 1; }
+          ls -la dist
+          gh release create "$TAG" dist/*.apk \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "漫剧 TV 自用版 $TAG" \
+            --notes "自用分支自动构建。基于 tsukiyo-zero/hongguoTV（GPL-3.0-only）修改，完整对应源码即本仓库本次提交，LICENSE / NOTICE.md 随源码提供。非红果官方客户端，与内容平台无隶属关系。若配置了签名 Secrets，会同时提供 release 与 debug 包；否则只有 debug 包。"
+          echo "已发布 Release：$TAG"
