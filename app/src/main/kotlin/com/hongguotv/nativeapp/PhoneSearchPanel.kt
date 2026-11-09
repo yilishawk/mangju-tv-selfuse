@@ -120,7 +120,7 @@ internal class PhoneSearchPanel(
 
     fun entry(): View = input
 
-    fun findFocus(): View? = results.findFocus()
+    // 不自定义 findFocus()：继承 ViewGroup 的实现即可，与 TvSearchPanel 的语义保持一致。
 
     fun middleEntry(): View? = null
 

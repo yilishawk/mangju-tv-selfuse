@@ -68,8 +68,9 @@ internal class PhonePlaybackShell(context: Context) : LinearLayout(context) {
             "下一集" to { onNext?.invoke() },
             "全屏" to { onFullscreen?.invoke(!fullscreen) },
         ).forEach { (label, click) ->
+            // 包一层 lambda：?.invoke() 会推断成 () -> Unit?，这里需要 () -> Unit。
             actions.addView(
-                action(label, click),
+                action(label) { click() },
                 LinearLayout.LayoutParams(0, dp(48), 1f).apply { rightMargin = dp(8) },
             )
         }
