@@ -146,6 +146,9 @@ class MainActivity : Activity() {
     private var phonePlaybackShell: PhonePlaybackShell? = null
     private var phoneSearchPanel: PhoneSearchPanel? = null
     private var phoneSwipe: PhoneSwipeGesture? = null
+    // 手机播放页按片源宽高自动分流：true=竖屏片源(ZOOM 铺满)，false=横屏片源(FIT 居中)。
+    // null 表示还没判定过；用它去重，避免每秒 tick 反复给 PlayerView 赋同一个 resizeMode。
+    private var phonePortraitSource: Boolean? = null
     private val discoveryBrowser = DiscoveryBrowserState()
     private var discoveryScreen: DiscoveryScreen? = null
     private lateinit var tvTools: TvTools
@@ -336,6 +339,9 @@ class MainActivity : Activity() {
             override fun run() {
                 if (!foreground || isDestroyed) return
                 if (screen == "player") {
+                    // 兜底：切集/复用 player/伴机接管时 onVideoSizeChanged 可能不重复触发，
+                    // 每秒用当前 videoSize 校正一次手机播放页的缩放模式。
+                    syncPhoneResize()
                     if (sleepTimer.poll()) stopForSleep()
                     updateClock()
                     if (hud.visibility == View.VISIBLE) updatePlaybackText()
@@ -3004,12 +3010,14 @@ class MainActivity : Activity() {
             val view =
                 PlayerView(this).apply {
                     useController = false
-                    // 手机进播放页即铺满：片源是 16:9，ZOOM 等比放大裁掉左右填满竖屏。
-                    // TV 仍按用户在设置里选的画面模式走。
+                    // 手机默认 FIT：横版片源居中完整显示、不裁左右；竖版片源由
+                    // onVideoSizeChanged 自动切 ZOOM 铺满。TV 仍按设置里的画面模式走。
                     resizeMode =
-                        if (isPhone) androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+                        if (isPhone) androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_FIT
                         else frameResizeMode()
                     isFocusable = false
+                    // 点画面收起选集弹层；短点击由 PhoneSwipeGesture.performClick() 转到这里。
+                    if (isPhone) setOnClickListener { phonePlaybackShell?.hideEpisodes() }
                     setKeepContentOnPlayerReset(true)
                     setShutterBackgroundColor(Color.BLACK)
                     setShowBuffering(PlayerView.SHOW_BUFFERING_ALWAYS)
@@ -3020,7 +3028,7 @@ class MainActivity : Activity() {
                 val shell =
                     PhonePlaybackShell(this).apply {
                         onNext = { playNextEpisode() }
-                        // 进页面即全屏，不再有「点全屏」这一步；选集常驻展开，点数字直接切集。
+                        // 进页面即全屏；选集收在底部条里，点底栏才弹出，点画面自动收起。
                         bindEpisodes(
                             { detail?.episodes?.size ?: 0 },
                             { episodeIndex },
@@ -3722,6 +3730,17 @@ class MainActivity : Activity() {
                     )
                     it.setHandleAudioBecomingNoisy(true)
                     it.addAnalyticsListener(playbackDriftListener(it))
+                    // 常驻尺寸监听：独立于 playerListener 的 remove/re-add，
+                    // 正式播放与伴机 relay 两条路径都会回调。
+                    it.addListener(
+                        object : Player.Listener {
+                            override fun onVideoSizeChanged(videoSize: VideoSize) {
+                                syncPhoneResize()
+                            }
+                        }
+                    )
+                    // player 复用时不会再触发 onVideoSizeChanged，这里用已有尺寸先校正一次。
+                    syncPhoneResize()
                 }
             }
 
@@ -4401,6 +4420,27 @@ class MainActivity : Activity() {
         )
     }
 
+    /**
+     * 手机播放页按片源真实宽高自动分流：
+     * - 竖版片源（显示宽 < 高）→ ZOOM 等比放大铺满全屏；
+     * - 横版片源（显示宽 >= 高）→ FIT 居中完整显示，不裁左右。
+     * TV 版不参与，仍由 library.frameMode 决定；手机播放页以片源比例为准。
+     */
+    private fun syncPhoneResize() {
+        if (!isPhone || screen != "player") return
+        val view = playerView ?: return
+        val size = player?.videoSize ?: return
+        if (size.width <= 0 || size.height <= 0) return
+        // 非方形像素按 SAR 折算显示宽度，避免把变形片源误判成竖版。
+        val portrait = size.width * size.pixelWidthHeightRatio < size.height.toFloat()
+        val target =
+            if (portrait) androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+            else androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_FIT
+        if (phonePortraitSource == portrait && view.resizeMode == target) return
+        phonePortraitSource = portrait
+        view.resizeMode = target
+    }
+
     private fun frameResizeMode() =
         when (library.frameMode) {
             VideoFrameMode.FIT -> androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_FIT
@@ -4557,7 +4597,7 @@ class MainActivity : Activity() {
     }
 
     // 手机进播放页即全屏：只负责隐藏状态栏，绝不强制旋转。
-    // 视频层本身已是 MATCH_PARENT + ZOOM，「全屏」不再是一个需要点击才能进入的状态。
+    // 视频层是 MATCH_PARENT；缩放由 syncPhoneResize 按片源比例决定（竖版 ZOOM / 横版 FIT）。
     // 退出播放时由 closePlayer 清掉这个 flag。
     private fun setPhoneFullscreen(on: Boolean) {
         if (!isPhone) return

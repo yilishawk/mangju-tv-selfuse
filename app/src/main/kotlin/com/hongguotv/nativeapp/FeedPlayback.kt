@@ -358,6 +358,7 @@ internal fun shouldSelfHealTrial(
 
 @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
 internal class Media3TrialPlayback(context: Context) : TrialPlayback {
+    private val phone = context.packageName.endsWith(".phone")
     private var currentIndex = 0
     private var preloading = false
     private val preloadBuilder =
@@ -394,12 +395,9 @@ internal class Media3TrialPlayback(context: Context) : TrialPlayback {
         PlayerView(context).apply {
             useController = false
             isFocusable = false
-            // 手机版首页是红果式全屏竖版流：等比放大铺满（会裁掉横版片源的左右），
-            // TV 版保持 FIT 完整画面。按包名判定，用户自己横屏也不会变。
-            resizeMode =
-                if (context.packageName.endsWith(".phone"))
-                    AspectRatioFrameLayout.RESIZE_MODE_ZOOM
-                else AspectRatioFrameLayout.RESIZE_MODE_FIT
+            // 先按 FIT 完整显示；竖版片源由 onVideoSizeChanged 自动切 ZOOM 铺满，
+            // 横版片源保持 FIT 居中，不裁左右。TV 版始终 FIT。
+            resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
             setShowBuffering(PlayerView.SHOW_BUFFERING_WHEN_PLAYING)
             this.player = this@Media3TrialPlayback.player
         }
@@ -474,8 +472,26 @@ internal class Media3TrialPlayback(context: Context) : TrialPlayback {
                             "Home first-frame elapsedMs=${android.os.SystemClock.elapsedRealtime()-startedAt}",
                         )
                 }
+
+                // 不判 active()：换剧时尺寸事件可能早于 activeId 赋值；
+                // resizeMode 是全局属性，按最近一集片源比例校正即可。
+                override fun onVideoSizeChanged(videoSize: VideoSize) {
+                    applyTrialResize(videoSize)
+                }
             }
         )
+        // 复用播放器时不会再触发尺寸变化，这里用已有尺寸先校正一次。
+        applyTrialResize(player.videoSize)
+    }
+
+    /** 手机首页试播按片源宽高分流：竖版铺满，横版居中不裁剪。TV 版恒 FIT。 */
+    private fun applyTrialResize(size: VideoSize) {
+        if (!phone) return
+        if (size.width <= 0 || size.height <= 0) return
+        val portrait = size.width * size.pixelWidthHeightRatio < size.height.toFloat()
+        surface.resizeMode =
+            if (portrait) AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+            else AspectRatioFrameLayout.RESIZE_MODE_FIT
     }
 
     private fun key(clip: TrialClip) = clip.detail.series.id + ":" + clip.episodeId

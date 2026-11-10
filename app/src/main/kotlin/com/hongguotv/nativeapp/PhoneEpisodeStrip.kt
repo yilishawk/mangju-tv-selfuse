@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 package com.hongguotv.nativeapp
 
-// 手机播放页常驻展开的选集宫格：不弹 Dialog，点数字直接切集。
+// 手机播放页底部选集弹层里的宫格：默认随弹层收起，点数字直接切集。
+// 分段与手动翻组逻辑保留：userPaged 防止点「下一组」后被当前集所在组覆盖回去。
 
 import android.content.Context
 import android.view.Gravity
@@ -9,7 +10,7 @@ import android.view.View
 import android.widget.LinearLayout
 import android.widget.TextView
 
-/** Always-expanded episode grid for the phone playback shell. */
+/** Episode grid hosted by the phone playback shell's bottom sheet. */
 internal class PhoneEpisodeStrip(context: Context) : LinearLayout(context) {
     private var countProvider: () -> Int = { 0 }
     private var currentProvider: () -> Int = { 0 }
