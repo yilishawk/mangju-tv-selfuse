@@ -77,7 +77,7 @@ internal class PhonePlaybackShell(context: Context) : FrameLayout(context) {
 
         // 顶部集数条：只显示真实状态，不放假的倍速 / 三点按钮。
         topBar.apply {
-            orientation = HORIZONTAL
+            orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setBackgroundColor(Color.argb(170, 8, 14, 20))
             setPadding(dp(14), dp(10), dp(14), dp(10))
@@ -92,7 +92,7 @@ internal class PhonePlaybackShell(context: Context) : FrameLayout(context) {
 
         // 右侧竖排：下一集 / 沉浸，都是真实可用操作。sideActions 自己不隐藏，避免锁死。
         sideActions.apply {
-            orientation = VERTICAL
+            orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
             setPadding(dp(6), dp(6), dp(10), dp(6))
         }
@@ -109,7 +109,7 @@ internal class PhonePlaybackShell(context: Context) : FrameLayout(context) {
 
         // 底部常驻展开选集：半透明叠在视频上，不占独立分块。
         infoPanel.apply {
-            orientation = VERTICAL
+            orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.argb(205, 8, 14, 20))
             setPadding(dp(14), dp(12), dp(14), dp(12))
         }
