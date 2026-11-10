@@ -394,7 +394,12 @@ internal class Media3TrialPlayback(context: Context) : TrialPlayback {
         PlayerView(context).apply {
             useController = false
             isFocusable = false
-            resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
+            // 手机版首页是红果式全屏竖版流：等比放大铺满（会裁掉横版片源的左右），
+            // TV 版保持 FIT 完整画面。按包名判定，用户自己横屏也不会变。
+            resizeMode =
+                if (context.packageName.endsWith(".phone"))
+                    AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+                else AspectRatioFrameLayout.RESIZE_MODE_FIT
             setShowBuffering(PlayerView.SHOW_BUFFERING_WHEN_PLAYING)
             this.player = this@Media3TrialPlayback.player
         }

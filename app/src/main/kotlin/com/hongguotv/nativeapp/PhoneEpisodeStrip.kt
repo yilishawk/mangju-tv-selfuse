@@ -15,7 +15,9 @@ internal class PhoneEpisodeStrip(context: Context) : LinearLayout(context) {
     private var currentProvider: () -> Int = { 0 }
     private var select: (Int) -> Unit = {}
     private var group = 0
-    private var lastCurrentGroup = -1
+    // 用户手动翻过组后，render 不许再用「当前播放集所在组」把 group 覆盖回去。
+    // 上一版正是这里导致点「下一组」立刻弹回原组，看起来像按钮没反应。
+    private var userPaged = false
 
     private val heading = TextView(context)
     private val pager = LinearLayout(context)
@@ -61,11 +63,21 @@ internal class PhoneEpisodeStrip(context: Context) : LinearLayout(context) {
         countProvider = count
         currentProvider = current
         select = onSelect
+        userPaged = false
+        group = if (count() > 0) current().coerceAtLeast(0) / 20 else 0
         render()
     }
 
-    /** Called on every episode transition so the highlighted cell and group follow playback. */
-    fun refresh() = render()
+    /** 每次切集刷新高亮。自动连播跨组时清掉手动标记，跟随播放；否则保持用户翻到的组。 */
+    fun refresh() {
+        val count = countProvider()
+        if (count > 0) {
+            val current = currentProvider().coerceIn(0, count - 1)
+            if (userPaged && (current < group * 20 || current >= (group + 1) * 20))
+                userPaged = false
+        }
+        render()
+    }
 
     private fun render() {
         val count = countProvider()
@@ -75,11 +87,7 @@ internal class PhoneEpisodeStrip(context: Context) : LinearLayout(context) {
         }
         visibility = View.VISIBLE
         val current = currentProvider().coerceIn(0, count - 1)
-        val wantedGroup = current / 20
-        if (lastCurrentGroup != wantedGroup) {
-            group = wantedGroup
-            lastCurrentGroup = wantedGroup
-        }
+        if (!userPaged) group = current / 20
         if (group * 20 >= count) group = count / 20
 
         heading.text = "选集  ·  正在看第 ${current + 1} 集  ·  共 $count 集"
@@ -87,13 +95,13 @@ internal class PhoneEpisodeStrip(context: Context) : LinearLayout(context) {
         val previous =
             button("‹ 上一组", group > 0) {
                 group--
-                lastCurrentGroup = -1
+                userPaged = true
                 render()
             }
         val next =
             button("下一组 ›", (group + 1) * 20 < count) {
                 group++
-                lastCurrentGroup = -1
+                userPaged = true
                 render()
             }
         val range = label("第 ${group * 20 + 1}—${minOf((group + 1) * 20, count)} 集", 12f)

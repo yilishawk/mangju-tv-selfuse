@@ -1054,29 +1054,10 @@ class MainActivity : Activity() {
             nav.forEach { it.nextFocusDownId = typeButtons.getValue(library.contentType).id }
         }
         if (tab == 1) {
-            // 手机恒用单列系统输入法；TV 的三栏遥控面板（含屏幕键盘入口）不创建。
-            if (isPhone) {
-                val panel =
-                    PhoneSearchPanel(
-                        this,
-                        searchDraft ?: query,
-                        library.searches().map { it.query },
-                        ::runSearch,
-                        ::returnToDiscovery,
-                    )
-                phoneSearchPanel = panel
-                tvSearchPanel = null
-                searchInput = panel.input
-                searchButton = panel.searchButton
-                searchSuggestions = null
-                panel.resultEntry = { continuousCatalog?.grid?.takeIf { catalog.isNotEmpty() } }
-                container.addView(panel, lp(-1, 0).apply { weight = 1f })
-                if (query.isBlank()) {
-                    message(panel.results, "输入关键词搜索剧集，或从最近搜索里挑一个")
-                    panel.entry().requestFocus()
-                    return
-                }
-            } else if (tvSearchOpen || query.isNotBlank()) {
+            // 剧场页：手机和 TV 都走单列搜索行 + DiscoveryScreen 的筛选组与视频网格。
+            // 上一版手机在这里 early return，只给一句「输入关键词」，筛选和展示全没了。
+            // TV 的三栏遥控面板 / 屏幕键盘只在 TV 且 tvSearchOpen 时创建。
+            if (!isPhone && (tvSearchOpen || query.isNotBlank())) {
                 val panel =
                     TvSearchPanel(
                         this,
@@ -3023,7 +3004,11 @@ class MainActivity : Activity() {
             val view =
                 PlayerView(this).apply {
                     useController = false
-                    resizeMode = frameResizeMode()
+                    // 手机进播放页即铺满：片源是 16:9，ZOOM 等比放大裁掉左右填满竖屏。
+                    // TV 仍按用户在设置里选的画面模式走。
+                    resizeMode =
+                        if (isPhone) androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+                        else frameResizeMode()
                     isFocusable = false
                     setKeepContentOnPlayerReset(true)
                     setShutterBackgroundColor(Color.BLACK)
@@ -3035,14 +3020,13 @@ class MainActivity : Activity() {
                 val shell =
                     PhonePlaybackShell(this).apply {
                         onNext = { playNextEpisode() }
-                        onFullscreen = { setPhoneFullscreen(it) }
-                        // 选集常驻展开：点数字直接切集，不再需要「选集」弹窗。
+                        // 进页面即全屏，不再有「点全屏」这一步；选集常驻展开，点数字直接切集。
                         bindEpisodes(
                             { detail?.episodes?.size ?: 0 },
                             { episodeIndex },
                         ) { index -> playEpisode(index) }
                     }
-                // 甲方案：PlayerView 放进居中 16:9 的 videoFrame，playerHost 只做渐变背景与叠加层。
+                // 视频层铺满整屏；顶部集数条、右侧竖排、底部选集都是叠加层。
                 shell.videoFrame.addView(view, FrameLayout.LayoutParams(-1, -1))
                 phoneSwipe =
                     PhoneSwipeGesture(
@@ -3053,6 +3037,8 @@ class MainActivity : Activity() {
                     ).also { gesture -> view.setOnTouchListener(gesture) }
                 phonePlaybackShell = shell
                 root.addView(shell, FrameLayout.LayoutParams(-1, -1))
+                // 进入播放页就隐藏状态栏，不需要用户再点一次「全屏」。
+                setPhoneFullscreen(true)
             } else root.addView(view, FrameLayout.LayoutParams(-1, -1))
             social.attach(root)
             playbackClock = TextClock(this).apply {
@@ -4570,11 +4556,11 @@ class MainActivity : Activity() {
         }, selected = options.indexOf(library.maxQuality))
     }
 
-    // 手机形态：16:9 画面居中、上下渐变填充；点「全屏」只隐藏状态栏与叠加层，绝不强制旋转。
-    // 用户要横屏时自己转手机；Manifest 是 unspecified，configChanges 保证旋转不重建 Activity。
+    // 手机进播放页即全屏：只负责隐藏状态栏，绝不强制旋转。
+    // 视频层本身已是 MATCH_PARENT + ZOOM，「全屏」不再是一个需要点击才能进入的状态。
+    // 退出播放时由 closePlayer 清掉这个 flag。
     private fun setPhoneFullscreen(on: Boolean) {
         if (!isPhone) return
-        phonePlaybackShell?.setFullscreen(on)
         if (on) window.addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN)
         else window.clearFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN)
         main.post { phonePlaybackShell?.playerHost?.requestLayout() }
@@ -4845,10 +4831,7 @@ class MainActivity : Activity() {
 
     @Deprecated("TV remote back is handled through the activity")
     override fun onBackPressed() {
-        if (isPhone && phonePlaybackShell?.isFullscreen() == true) {
-            setPhoneFullscreen(false)
-            return
-        }
+        // 手机播放页默认就全屏，没有「先退出全屏」这一步，返回直接回列表。
         goBack()
     }
 
@@ -4858,8 +4841,7 @@ class MainActivity : Activity() {
             val key = event.keyCode
             if (key == KeyEvent.KEYCODE_BACK) {
                 if (event.action == KeyEvent.ACTION_UP) {
-                    if (isPhone && phonePlaybackShell?.isFullscreen() == true) setPhoneFullscreen(false)
-                    else goBack()
+                    goBack()
                 }
                 return true
             }

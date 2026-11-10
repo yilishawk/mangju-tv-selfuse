@@ -12,6 +12,7 @@ import android.os.Looper
 import android.text.TextUtils
 import android.view.Gravity
 import android.view.KeyEvent
+import android.view.MotionEvent
 import android.view.View
 import android.widget.*
 import com.hongguotv.core.*
@@ -153,10 +154,36 @@ internal class HomeFeedScreen(
             b.nextFocusLeftId = typeChoices.getOrNull(i - 1)?.id ?: b.id
             b.nextFocusRightId = typeChoices.getOrNull(i + 1)?.id ?: b.id
         }
-        if (phone) types.setBackgroundColor(Color.argb(160, 8, 14, 20))
+        if (phone) {
+            types.setBackgroundColor(Color.argb(160, 8, 14, 20))
+            // 手机是触屏：点一下立即切分类，不要求先拿焦点再按确认（TV 才需要那套）。
+            listOf(recommendButton, comicButton, realButton).forEach { b ->
+                b.isFocusable = false
+                b.isFocusableInTouchMode = false
+                b.background = null
+                b.textSize = 15f
+                b.setPadding(dp(4), dp(8), dp(4), dp(8))
+                (b.layoutParams as LayoutParams).apply {
+                    width = 0
+                    weight = 1f
+                    rightMargin = dp(4)
+                }
+                b.requestLayout()
+            }
+            // 「换一批」收成右侧小胶囊，不再和三个分类各占 1/4 屏宽。
+            refresh.apply {
+                textSize = 12f
+                (layoutParams as LayoutParams).apply {
+                    width = -2
+                    weight = 0f
+                    rightMargin = 0
+                }
+                requestLayout()
+            }
+        }
         addView(types, lp(-1, dp(48)))
-        // 手机改成沉浸式视频层：16:9 画面完整居中，上下用暗色渐变填充（不裁画面、不变形）；
-        // TV 保持左右 2.2 : 1 的原有分栏，逻辑一行不动。
+        // 手机改成红果式全屏竖版视频流：画面铺满整个视频层（ZOOM 等比裁切），
+        // 信息压在底部、操作竖排在右侧；TV 保持左右 2.2 : 1 的原有分栏，逻辑一行不动。
         val content =
             LinearLayout(activity).apply {
                 orientation = if (phone) VERTICAL else HORIZONTAL
@@ -199,15 +226,9 @@ internal class HomeFeedScreen(
             },
         )
         if (phone) {
-            // 甲方案：播放器保持完整 16:9 居中，上下留出的区域由渐变背景填充。
-            phoneBackdrop!!.addView(
-                stage,
-                FrameLayout.LayoutParams(
-                    -1,
-                    (activity.resources.displayMetrics.widthPixels * 9f / 16f).toInt(),
-                    Gravity.CENTER,
-                ),
-            )
+            // 全屏铺满：PlayerView 用 ZOOM 等比放大填满竖屏（见 FeedPlayback），
+            // 不再上下留黑边；底部信息与右侧操作是叠在视频上的半透明层。
+            phoneBackdrop!!.addView(stage, FrameLayout.LayoutParams(-1, -1))
         } else {
             content.addView(
                 stage,
@@ -236,7 +257,7 @@ internal class HomeFeedScreen(
         if (!phone) info.addView(Space(activity), lp(1, 0).apply { weight = 1f })
         info.addView(
             label(
-                if (phone) "点画面看操作  ·  点「观看全集」直接播放"
+                if (phone) "上滑换一部  ·  点「观看全集」直接播放"
                 else "↑ ↓  换一部\n确定  打开操作\n返回  顶部导航",
                 13f,
                 TvStyle.muted,
@@ -332,6 +353,39 @@ internal class HomeFeedScreen(
                 }
                 else -> false
             }
+        }
+        if (phone) {
+            // 红果式上下滑换剧：上滑下一部、下滑上一部，复用 TV 的 DPAD_UP/DOWN 同一条 move()。
+            // 手机的操作条常驻显示，所以这里吞掉点击没关系；TV 分支一行不动。
+            var startX = 0f
+            var startY = 0f
+            var swiped = false
+            val swipe =
+                View.OnTouchListener { _, event ->
+                    when (event.actionMasked) {
+                        MotionEvent.ACTION_DOWN -> {
+                            startX = event.x
+                            startY = event.y
+                            swiped = false
+                            true
+                        }
+                        MotionEvent.ACTION_UP -> {
+                            val dy = event.y - startY
+                            val dx = event.x - startX
+                            if (!swiped &&
+                                kotlin.math.abs(dy) >= dp(90) &&
+                                kotlin.math.abs(dy) >= kotlin.math.abs(dx) * 1.2f
+                            ) {
+                                swiped = true
+                                move(if (dy < 0) 1 else -1)
+                            }
+                            true
+                        }
+                        else -> true
+                    }
+                }
+            stage.setOnTouchListener(swipe)
+            playback.view.setOnTouchListener(swipe)
         }
         playback.onError = { error -> lastPlaybackError = error }
         playback.status = { value ->
@@ -465,6 +519,21 @@ internal class HomeFeedScreen(
         intro.text =
             series?.description?.ifBlank { "先试试看，喜欢这部作品就选择观看全集。" } ?: "选择漫剧或真人剧，上下换一部，找到想追的故事。"
         tag.text = if (state.recommendation) "推荐 · 第一集试播" else "${state.category.label}推荐 · 第一集试播"
+        if (phone) {
+            // 触屏 tab 没有焦点态，用颜色/字重直接标出当前分类。
+            val active =
+                when {
+                    state.recommendation -> recommendButton
+                    state.category == DramaCategory.COMIC -> comicButton
+                    else -> realButton
+                }
+            listOf(recommendButton, comicButton, realButton).forEach { b ->
+                val on = b === active
+                b.setTextColor(if (on) TvStyle.accent else TvStyle.text)
+                b.setTypeface(null, if (on) Typeface.BOLD else Typeface.NORMAL)
+                b.alpha = if (on) 1f else .65f
+            }
+        }
         paintActions()
     }
 

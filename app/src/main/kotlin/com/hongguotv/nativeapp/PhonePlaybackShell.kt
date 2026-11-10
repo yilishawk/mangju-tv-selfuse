@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-only
 package com.hongguotv.nativeapp
 
-// 手机播放外壳：视频层铺满剩余空间，16:9 画面完整居中（上下暗色渐变填充，不裁画面不变形）；
-// 顶部集数条、右侧竖排真实操作、底部常驻展开选集宫格。
-// 点「全屏」只隐藏状态栏与叠加层，绝不强制旋转，横屏交给用户自己转手机。
+// 手机播放外壳：进入播放页即全屏铺满（16:9 片源由 MainActivity 设 ZOOM 等比裁切），
+// 不再只有屏幕中间一条，也不需要点「全屏」。
+// 顶部集数条、右侧竖排、底部常驻展开选集都是叠在视频上的半透明层。
+// 右侧「沉浸」只收起顶部条与选集，视频始终铺满；上滑切下一集始终可用。
+// 横屏完全交给用户自己转手机，这里不碰 requestedOrientation。
 
 import android.content.Context
 import android.graphics.Color
@@ -15,8 +17,8 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 
-/** Portrait playback shell. The host keeps the existing PlayerView instance untouched. */
-internal class PhonePlaybackShell(context: Context) : LinearLayout(context) {
+/** Fullscreen portrait playback shell. The host keeps the existing PlayerView instance untouched. */
+internal class PhonePlaybackShell(context: Context) : FrameLayout(context) {
     val playerHost = FrameLayout(context)
     val videoFrame = FrameLayout(context)
     val infoPanel = LinearLayout(context)
@@ -25,14 +27,13 @@ internal class PhonePlaybackShell(context: Context) : LinearLayout(context) {
     private val topBar = LinearLayout(context)
     private val sideActions = LinearLayout(context)
     private val episodeLabel = TextView(context)
-    private val portraitHeight = resources.displayMetrics.widthPixels * 9 / 16
+    private val immersiveButton: TextView
     private val infoHeight = (resources.displayMetrics.heightPixels * .34f).toInt()
-    private var fullscreen = false
+    private var chromeHidden = false
     private var countProvider: () -> Int = { 0 }
     private var currentProvider: () -> Int = { 0 }
 
     var onNext: (() -> Unit)? = null
-    var onFullscreen: ((Boolean) -> Unit)? = null
 
     private fun dp(n: Int) = (n * resources.displayMetrics.density).toInt()
 
@@ -50,8 +51,9 @@ internal class PhonePlaybackShell(context: Context) : LinearLayout(context) {
         }
 
     init {
-        orientation = VERTICAL
         setBackgroundColor(Color.BLACK)
+        // 视频层铺满整个 shell（FrameLayout 叠加），不再切成上视频 / 下信息两块。
+        addView(playerHost, LayoutParams(-1, -1))
         playerHost.background =
             GradientDrawable(
                 GradientDrawable.Orientation.TOP_BOTTOM,
@@ -62,10 +64,8 @@ internal class PhonePlaybackShell(context: Context) : LinearLayout(context) {
                 ),
             )
         videoFrame.background = TvStyle.shape(context, Color.BLACK)
-        playerHost.addView(
-            videoFrame,
-            FrameLayout.LayoutParams(-1, portraitHeight, Gravity.CENTER),
-        )
+        playerHost.addView(videoFrame, FrameLayout.LayoutParams(-1, -1))
+
         swipeHint.apply {
             textSize = 13f
             setTextColor(TvStyle.text)
@@ -90,7 +90,7 @@ internal class PhonePlaybackShell(context: Context) : LinearLayout(context) {
         topBar.addView(episodeLabel, LinearLayout.LayoutParams(-1, -2))
         playerHost.addView(topBar, FrameLayout.LayoutParams(-1, -2, Gravity.TOP))
 
-        // 右侧竖排：下一集 / 全屏，都是真实可用操作。
+        // 右侧竖排：下一集 / 沉浸，都是真实可用操作。sideActions 自己不隐藏，避免锁死。
         sideActions.apply {
             orientation = VERTICAL
             gravity = Gravity.CENTER
@@ -100,24 +100,22 @@ internal class PhonePlaybackShell(context: Context) : LinearLayout(context) {
             action("下一集") { onNext?.invoke() },
             LinearLayout.LayoutParams(-2, dp(48)).apply { bottomMargin = dp(10) },
         )
-        sideActions.addView(
-            action("全屏") { onFullscreen?.invoke(!fullscreen) },
-            LinearLayout.LayoutParams(-2, dp(48)),
-        )
+        immersiveButton = action("沉浸") { toggleChrome() }
+        sideActions.addView(immersiveButton, LinearLayout.LayoutParams(-2, dp(48)))
         playerHost.addView(
             sideActions,
             FrameLayout.LayoutParams(-2, -2, Gravity.END or Gravity.CENTER_VERTICAL),
         )
-        addView(playerHost, LayoutParams(-1, 0, 1f))
 
+        // 底部常驻展开选集：半透明叠在视频上，不占独立分块。
         infoPanel.apply {
             orientation = VERTICAL
-            setBackgroundColor(TvStyle.background)
+            setBackgroundColor(Color.argb(205, 8, 14, 20))
             setPadding(dp(14), dp(12), dp(14), dp(12))
         }
         infoPanel.addView(
             TextView(context).apply {
-                text = "播放中 · 全屏时上滑切换下一集"
+                text = "播放中 · 上滑切换下一集"
                 textSize = 12f
                 setTextColor(TvStyle.muted)
             },
@@ -130,8 +128,21 @@ internal class PhonePlaybackShell(context: Context) : LinearLayout(context) {
             },
             LinearLayout.LayoutParams(-1, 0, 1f).apply { topMargin = dp(6) },
         )
-        addView(infoPanel, LayoutParams(-1, infoHeight))
+        addView(infoPanel, LayoutParams(-1, infoHeight, Gravity.BOTTOM))
     }
+
+    /** 只收起顶部条与选集；视频仍铺满，右侧按钮保留以便恢复。 */
+    private fun toggleChrome() {
+        chromeHidden = !chromeHidden
+        val visibility = if (chromeHidden) View.GONE else View.VISIBLE
+        infoPanel.visibility = visibility
+        topBar.visibility = visibility
+        immersiveButton.text = if (chromeHidden) "显示操作" else "沉浸"
+        if (!chromeHidden) showHint(null)
+    }
+
+    /** 视频恒为全屏铺满态，上滑切下一集始终启用；没有「进入全屏」这一步。 */
+    fun isFullscreen() = true
 
     /** Episodes stay expanded; clicking a number switches immediately, no dialog. */
     fun bindEpisodes(count: () -> Int, current: () -> Int, select: (Int) -> Unit) {
@@ -151,17 +162,6 @@ internal class PhonePlaybackShell(context: Context) : LinearLayout(context) {
         episodeLabel.text =
             if (total > 0) "第 ${currentProvider() + 1} 集  ·  共 $total 集" else "选集"
     }
-
-    fun setFullscreen(on: Boolean) {
-        fullscreen = on
-        val chromeVisibility = if (on) View.GONE else View.VISIBLE
-        infoPanel.visibility = chromeVisibility
-        topBar.visibility = chromeVisibility
-        sideActions.visibility = chromeVisibility
-        if (!on) showHint(null)
-    }
-
-    fun isFullscreen() = fullscreen
 
     fun showHint(text: String?) {
         swipeHint.text = text.orEmpty()

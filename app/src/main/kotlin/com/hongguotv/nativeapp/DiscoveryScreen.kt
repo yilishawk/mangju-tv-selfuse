@@ -20,6 +20,9 @@ internal class DiscoveryScreen(
     private val fetch:
         (DiscoverySelection, DiscoveryCursor?, (FilteredDiscoveryPage?, Throwable?) -> Unit) -> Unit,
 ) : LinearLayout(context) {
+    // 手机剧场用 2 列竖版大卡，TV 保持 6 列；海报高度按实际列数算。
+    private val phone = context.packageName.endsWith(".phone")
+    private val columns = if (phone) 2 else 6
     private val types = LinearLayout(context)
     private val groups = LinearLayout(context).apply { orientation = VERTICAL }
     private val scroll =
@@ -65,15 +68,15 @@ internal class DiscoveryScreen(
         bar.addView(reset)
         bar.addView(refresh)
         addView(bar)
-        addView(scroll, LayoutParams(-1, dp(200)))
+        addView(scroll, LayoutParams(-1, dp(if (phone) 132 else 200)))
         addView(summary)
         browser =
             ContinuousCatalogView(
                 context,
-                6,
+                columns,
                 toggle,
                 { item, recycled ->
-                    (recycled as? CatalogPosterCard ?: CatalogPosterCard(context)).apply {
+                    (recycled as? CatalogPosterCard ?: CatalogPosterCard(context, columns)).apply {
                         show(item)
                         cover(image, item.cover)
                     }
@@ -88,7 +91,7 @@ internal class DiscoveryScreen(
                 val header = getChildAt(0).height + scroll.height + summary.height
                 if (browseStep == 0)
                     browseStep = (browser.grid.getChildAt(0)?.height ?: dp(180)) + dp(10)
-                val offset = if (state.expanded) minOf(header, (position / 6) * browseStep) else 0
+                val offset = if (state.expanded) minOf(header, (position / columns) * browseStep) else 0
                 if (headerOffset != offset) {
                     headerOffset = offset
                     requestLayout()
@@ -328,7 +331,7 @@ internal class DiscoveryScreen(
             setTextColor(TvStyle.text)
             setPadding(0, 0, 0, dp(16))
         })
-        val grid = GridLayout(context).apply { columnCount = 4 }
+        val grid = GridLayout(context).apply { columnCount = if (phone) 2 else 4 }
         val cells = options.map { option ->
             button(option.label, { state.selection.values[group.type].orEmpty() == option.id }) {
                 filterDialog?.dismiss()
