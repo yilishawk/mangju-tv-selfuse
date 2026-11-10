@@ -6,6 +6,7 @@ package com.hongguotv.nativeapp
 import android.app.Activity
 import android.graphics.Color
 import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.os.Handler
 import android.os.Looper
 import android.text.TextUtils
@@ -152,12 +153,28 @@ internal class HomeFeedScreen(
             b.nextFocusLeftId = typeChoices.getOrNull(i - 1)?.id ?: b.id
             b.nextFocusRightId = typeChoices.getOrNull(i + 1)?.id ?: b.id
         }
+        if (phone) types.setBackgroundColor(Color.argb(160, 8, 14, 20))
         addView(types, lp(-1, dp(48)))
-        // 手机改成上下分栏：上方 16:9 试播，下方文字信息；TV 保持左右 2.2 : 1。
+        // 手机改成沉浸式视频层：16:9 画面完整居中，上下用暗色渐变填充（不裁画面、不变形）；
+        // TV 保持左右 2.2 : 1 的原有分栏，逻辑一行不动。
         val content =
             LinearLayout(activity).apply {
                 orientation = if (phone) VERTICAL else HORIZONTAL
             }
+        val phoneBackdrop =
+            if (phone)
+                FrameLayout(activity).apply {
+                    background =
+                        GradientDrawable(
+                            GradientDrawable.Orientation.TOP_BOTTOM,
+                            intArrayOf(
+                                Color.argb(255, 12, 22, 30),
+                                Color.argb(255, 28, 48, 60),
+                                Color.argb(255, 8, 14, 20),
+                            ),
+                        )
+                }
+            else null
         stage.isFocusable = true
         stage.isFocusableInTouchMode = true
         stage.isClickable = true
@@ -181,15 +198,25 @@ internal class HomeFeedScreen(
                 setMargins(dp(10), 0, dp(10), dp(10))
             },
         )
-        content.addView(
-            stage,
-            if (phone) lp(-1, (activity.resources.displayMetrics.widthPixels * 9f / 16f).toInt())
-            else
+        if (phone) {
+            // 甲方案：播放器保持完整 16:9 居中，上下留出的区域由渐变背景填充。
+            phoneBackdrop!!.addView(
+                stage,
+                FrameLayout.LayoutParams(
+                    -1,
+                    (activity.resources.displayMetrics.widthPixels * 9f / 16f).toInt(),
+                    Gravity.CENTER,
+                ),
+            )
+        } else {
+            content.addView(
+                stage,
                 lp(0, -1).apply {
                     weight = 2.2f
                     rightMargin = dp(22)
                 },
-        )
+            )
+        }
         val info =
             LinearLayout(activity).apply {
                 orientation = VERTICAL
@@ -215,8 +242,16 @@ internal class HomeFeedScreen(
                 TvStyle.muted,
             ).apply { setLineSpacing(dp(6).toFloat(), 1f) }
         )
-        content.addView(info, if (phone) lp(-1, -2) else lp(0, -1).apply { weight = 1f })
-        addView(content, lp(-1, 0).apply { weight = 1f })
+        if (phone) {
+            // 信息层压在下方填充区，半透明，不遮挡 16:9 画面。
+            info.setBackgroundColor(Color.argb(190, 8, 14, 20))
+            info.setPadding(dp(14), dp(12), dp(14), dp(12))
+            phoneBackdrop!!.addView(info, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
+            addView(phoneBackdrop!!, lp(-1, 0).apply { weight = 1f })
+        } else {
+            content.addView(info, lp(0, -1).apply { weight = 1f })
+            addView(content, lp(-1, 0).apply { weight = 1f })
+        }
         pauseButton = button("暂停试播") { toggle() }
         watchButton =
             button("观看全集") {
@@ -240,19 +275,34 @@ internal class HomeFeedScreen(
         buttons.forEachIndexed { index, b ->
             actions.addView(
                 b,
-                lp(0, dp(44)).apply {
-                    weight = 1f
-                    if (index < buttons.lastIndex) rightMargin = dp(10)
-                },
+                if (phone) lp(-2, dp(44)).apply { bottomMargin = dp(8) }
+                else
+                    lp(0, dp(44)).apply {
+                        weight = 1f
+                        if (index < buttons.lastIndex) rightMargin = dp(10)
+                    },
             )
             b.nextFocusLeftId = buttons.getOrNull(index - 1)?.id ?: b.id
             b.nextFocusRightId = buttons.getOrNull(index + 1)?.id ?: b.id
             b.nextFocusUpId = stage.id
             b.nextFocusDownId = b.id
         }
-        actions.setPadding(0, dp(10), 0, 0)
-        actions.visibility = View.GONE
-        addView(actions)
+        if (phone) {
+            // 右侧竖排常驻，只保留真实可用的操作：暂播/观看全集/账户收藏。
+            actions.orientation = VERTICAL
+            actions.gravity = Gravity.CENTER
+            actions.setBackgroundColor(Color.argb(120, 8, 14, 20))
+            actions.setPadding(dp(8), dp(8), dp(8), dp(8))
+            actions.visibility = View.VISIBLE
+            phoneBackdrop!!.addView(
+                actions,
+                FrameLayout.LayoutParams(-2, -2, Gravity.END or Gravity.CENTER_VERTICAL),
+            )
+        } else {
+            actions.setPadding(0, dp(10), 0, 0)
+            actions.visibility = View.GONE
+            addView(actions)
+        }
         stage.nextFocusLeftId = stage.id
         stage.nextFocusRightId = stage.id
         stage.nextFocusUpId = stage.id
@@ -361,6 +411,8 @@ internal class HomeFeedScreen(
     }
 
     fun back(): Boolean {
+        // 手机右侧竖排操作常驻，返回键交给 Activity 处理，不再隐藏操作栏。
+        if (phone) return false
         if (actions.visibility != View.VISIBLE) return false
         actions.visibility = View.GONE
         stage.requestFocus()
@@ -375,7 +427,8 @@ internal class HomeFeedScreen(
     private fun showActions() {
         actions.visibility = View.VISIBLE
         paintActions()
-        (if (watchButton.isEnabled) watchButton else pauseButton).requestFocus()
+        // 触摸形态不抢焦点，避免点画面后焦点跳到右侧按钮。
+        if (!phone) (if (watchButton.isEnabled) watchButton else pauseButton).requestFocus()
     }
 
     private fun paintActions() {

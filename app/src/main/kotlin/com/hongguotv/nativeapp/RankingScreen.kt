@@ -237,7 +237,8 @@ internal class RankingScreen(
             return
         }
         val saved = state.selectedId
-        val columns = if (phone) 3 else 6
+        // 手机按红果剧场用 2 列竖版大卡，卡片更大。
+        val columns = if (phone) 2 else 6
         val list =
             ContinuousCatalogView(
                 activity,

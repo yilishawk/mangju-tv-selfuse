@@ -444,7 +444,7 @@ class MainActivity : Activity() {
             val shell = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
             shell.addView(root, LinearLayout.LayoutParams(-1, 0, 1f))
             val chrome =
-                PhoneChrome(this, listOf("首页", "找剧", "榜单", "我的")) { index ->
+                PhoneChrome(this, listOf("首页", "剧场", "榜单", "我的")) { index ->
                     switchTab(if (index <= 2) index else 3)
                 }
             phoneChrome = chrome
@@ -930,10 +930,18 @@ class MainActivity : Activity() {
             )
             phoneTop.addView(
                 text(
-                    listOf("首页", "找剧", "排行榜", "收藏", "观看历史", "账户预约", "设置")[tab],
+                    listOf("首页", "剧场", "排行榜", "收藏", "观看历史", "账户预约", "设置")[tab],
                     13f,
                     muted,
                 )
+            )
+            // 全局搜索入口：直接落到「剧场」页已有的单列输入框，不新增屏幕键盘。
+            phoneTop.addView(
+                text("🔍 搜索", 13f, accent).apply {
+                    setPadding(dp(10), dp(8), dp(4), dp(8))
+                    isClickable = true
+                    setOnClickListener { switchTab(1) }
+                },
             )
             container.addView(phoneTop)
             if (tab >= 3) {
@@ -1551,7 +1559,8 @@ class MainActivity : Activity() {
             return
         }
         val cards = mutableListOf<View>()
-        val count = if (isPhone) 3 else 6
+        // 手机按红果剧场用 2 列竖版大卡，卡片更大。
+        val count = if (isPhone) 2 else 6
         val gap = dp(14)
         val width =
             ((resources.displayMetrics.widthPixels * .9f - gap * (count - 1)) / count).toInt()
@@ -1879,9 +1888,9 @@ class MainActivity : Activity() {
         val requestQuery = query
         continuousKey = requestQuery
         val upper = searchInput ?: nav[tab]
-        // 手机一排 3 个大卡片；海报高度同步按 3 列算（见 CatalogPosterCard）。
+        // 手机按红果剧场用 2 列竖版大卡；海报高度同步按实际列数算（见 CatalogPosterCard）。
         val columns =
-            if (isPhone) 3
+            if (isPhone) 2
             else if (tvSearchPanel != null) {
                 if (widthDp() < 800) 2 else if (widthDp() < 1200) 3 else 4
             } else 6
@@ -2385,7 +2394,7 @@ class MainActivity : Activity() {
                     toggle("跨季自动连播（需开启自动连播）", library.seasonAutoplay) { library.seasonAutoplay = it }
                 }
                 1 -> {
-                    val labels = listOf("首页", "找剧", "排行榜", "收藏", "观看历史", "账户预约", "设置")
+                    val labels = listOf("首页", "剧场", "排行榜", "收藏", "观看历史", "账户预约", "设置")
                     lateinit var startup: TextView
                     startup = setting("启动页面  ·  ${labels[library.startupPage]}") {
                         tvTools.choose("启动页面", labels, startup, { choice ->
@@ -3033,7 +3042,8 @@ class MainActivity : Activity() {
                             { episodeIndex },
                         ) { index -> playEpisode(index) }
                     }
-                shell.playerHost.addView(view, FrameLayout.LayoutParams(-1, -1))
+                // 甲方案：PlayerView 放进居中 16:9 的 videoFrame，playerHost 只做渐变背景与叠加层。
+                shell.videoFrame.addView(view, FrameLayout.LayoutParams(-1, -1))
                 phoneSwipe =
                     PhoneSwipeGesture(
                         this,
@@ -4560,7 +4570,7 @@ class MainActivity : Activity() {
         }, selected = options.indexOf(library.maxQuality))
     }
 
-    // 手机形态：竖屏内嵌 16:9，点「全屏」只把播放器铺满当前竖屏，绝不强制旋转。
+    // 手机形态：16:9 画面居中、上下渐变填充；点「全屏」只隐藏状态栏与叠加层，绝不强制旋转。
     // 用户要横屏时自己转手机；Manifest 是 unspecified，configChanges 保证旋转不重建 Activity。
     private fun setPhoneFullscreen(on: Boolean) {
         if (!isPhone) return
