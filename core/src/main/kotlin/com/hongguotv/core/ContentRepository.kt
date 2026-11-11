@@ -984,7 +984,11 @@ constructor(
                             val empty = error is EmptyPlaybackResponseException
                             allEmpty = allEmpty && empty
                             if (!route.get && empty) emptyPosts++
-                            if (route.get || empty || PlayRetryPlan.temporary(error)) identity.routes.failed(route, clock(), empty)
+                            // 片尾 speculation 只有 2s 预算、只试一条路，它的失败不代表服务端不可用。
+                            // 若把这类失败记为 empty，会把该路径封进 30s 冷却，切下一集时前台
+                            // plan() 无路可走，统一报成「播放信息接口返回空响应」。
+                            if (!speculative && (route.get || empty || PlayRetryPlan.temporary(error)))
+                                identity.routes.failed(route, clock(), empty)
                             // GET 结构不符仍可换备用接口；POST 明确业务/格式错误不继续盲试。
                             if (!route.get && !PlayRetryPlan.temporary(error)) throw error
                         } finally {

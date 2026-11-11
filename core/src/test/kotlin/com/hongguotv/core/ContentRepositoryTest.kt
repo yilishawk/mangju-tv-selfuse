@@ -94,25 +94,30 @@ class ContentRepositoryTest {
         assertEquals(8, calls)
     }
 
+    /** 片尾预加载只有 2s 预算，它的失败不能替前台把路径判死，也不能触发身份轮换。 */
     @Test
-    fun backgroundOnlySamplesOnceAndStopsAtCooldownWithoutRegisteringAgain() {
+    fun backgroundFailuresDoNotPoisonForegroundRoutes() {
         var registrations = 0
-        var calls = 0
+        var playbackCalls = 0
+        var available = false
         val session = PlaybackDeviceSession {
             registrations++
             DeviceRegister.Registered((333 + registrations).toString(), "444")
         }
         val http = OkHttpClient.Builder().addInterceptor { chain ->
-            calls++
-            fixtureResponse(chain.request(), if (registrations > 1) videoTabModel else "")
+            val request = chain.request()
+            if (request.url.encodedPath.contains("multi_video_model")) playbackCalls++
+            fixtureResponse(request, if (available) videoTabModel else "")
         }.build()
         val repo = ContentRepository(http, playbackSession = session)
         repeat(5) { assertThrows(EmptyPlaybackResponseException::class.java) { repo.streamLadder("123", speculative = true) } }
-        assertEquals(4, calls)
         assertEquals(1, registrations)
+        // 每次后台失败都仍会真的试一条路，说明没有把自己写进 30s 冷却。
+        assertEquals(5, playbackCalls)
+        available = true
         assertEquals(1, repo.streamLadder("123").renditions.size)
-        assertEquals(5, calls)
-        assertEquals(2, registrations)
+        assertEquals(6, playbackCalls)
+        assertEquals(1, registrations)
     }
 
     @Test

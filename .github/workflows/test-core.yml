@@ -1,0 +1,87 @@
+name: core 单元测试
+
+# 与 build-apk.yml 完全独立：只跑 :core:test，不产出 APK、不发 Release。
+# 测试失败只影响本工作流，不会把 APK 构建拖红。
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'core/**'
+      - '.github/workflows/test-core.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mangju-core-test
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+
+      - name: 准备 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: 准备 Gradle 8.14.3（与 APK 构建同一套镜像直连）
+        shell: bash
+        run: |
+          set -e
+          GRADLE_ZIP="$RUNNER_TEMP/gradle-8.14.3-bin.zip"
+          for MIRROR in \
+            "https://mirrors.cloud.tencent.com/gradle/gradle-8.14.3-bin.zip" \
+            "https://mirrors.huaweicloud.com/gradle/gradle-8.14.3-bin.zip" \
+            "https://repo.huaweicloud.com/gradle/gradle-8.14.3-bin.zip" \
+            "https://services.gradle.org/distributions/gradle-8.14.3-bin.zip"; do
+            echo "尝试镜像: $MIRROR"
+            if curl -fsSL --connect-timeout 15 --max-time 300 -o "$GRADLE_ZIP" "$MIRROR"; then
+              echo "下载成功: $MIRROR"
+              break
+            fi
+            echo "该源失败，换下一个"
+          done
+          [ -s "$GRADLE_ZIP" ] || { echo "所有 Gradle 下载源均失败"; exit 1; }
+          unzip -q -o "$GRADLE_ZIP" -d "$RUNNER_TEMP/gradle-dist"
+          GRADLE_BIN="$RUNNER_TEMP/gradle-dist/gradle-8.14.3/bin/gradle"
+          chmod +x "$GRADLE_BIN"
+          "$GRADLE_BIN" --version | head -8
+          echo "GRADLE_BIN=$GRADLE_BIN" >> "$GITHUB_ENV"
+
+      - name: 安装 Android SDK Platform 36（根工程配置阶段需要）
+        shell: bash
+        run: |
+          set -e
+          SDKMGR="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMGR" ]; then
+            SDKMGR="$(command -v sdkmanager)"
+          fi
+          yes | "$SDKMGR" --licenses >/dev/null 2>&1 || true
+          "$SDKMGR" "platforms;android-36" "build-tools;36.0.0" "platform-tools" >/dev/null
+          echo "SDK ready"
+
+      - name: 运行 core 单元测试
+        shell: bash
+        run: |
+          set -e
+          "$GRADLE_BIN" :core:test --no-daemon --console=plain --stacktrace
+
+      - name: 上传测试报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-report
+          path: |
+            core/build/reports/tests/test/**/*
+            core/build/test-results/test/**/*.xml
+          if-no-files-found: ignore
+          retention-days: 14
