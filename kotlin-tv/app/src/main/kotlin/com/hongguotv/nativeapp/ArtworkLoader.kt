@@ -93,7 +93,9 @@ class ArtworkLoader(context: Context) {
         Thread(runnable, "hongguotv-artwork").apply { priority = Thread.NORM_PRIORITY - 1 }
     }
     private val signal = Object()
-    private val pending = PriorityQueue<Job>(compareBy<Job> { it.priority }.thenBy { it.order })
+    // The Comparator-only constructor is API 24 (Java 8); minSdk is 23, so the capacity overload
+    // - present since API 9 - carries the ordering instead. 11 is the JDK's default initial size.
+    private val pending = PriorityQueue<Job>(11, compareBy<Job> { it.priority }.thenBy { it.order })
     private val jobs = mutableMapOf<Key, Job>()
     private val bindings = WeakHashMap<ImageView, Binding>()
     private var owner = 0L
