@@ -20,7 +20,13 @@ data class AppUpdate(val versionCode: Long, val versionName: String, val minSdk:
         // 指过去会让「检查更新」拿到 404 或别人的版本；本仓库的 release.yml 才会产出
         // update.json 与 android6 安装包。
         const val REPOSITORY = "yilishawk/mangju-tv-selfuse"
-        const val RELEASES = "https://github.com/$REPOSITORY/releases"
+        // 国内直连 github.com:443 是超时，不是慢（2026-11-12 在 Redmi K30 5G 上实测：
+        // https://www.baidu.com 返回 200，https://github.com 报 Connection timed out；
+        // ping github.com 能通是因为 DNS 被污染到了假 IP）。所以更新地址走免费加速前缀：
+        // 它只是把同一份 release 资产转发出来，tag 与文件名都不变。
+        // 这个站哪天挂了，改这一行、重新发版即可 —— 别指望客户端自己换站。
+        const val MIRROR = "https://gh-proxy.com/"
+        const val RELEASES = "${MIRROR}https://github.com/$REPOSITORY/releases"
         const val MAX_APK_BYTES = 80L * 1024 * 1024
         fun parse(json: String): AppUpdate {
             val o = JSONObject(json)
@@ -28,7 +34,8 @@ data class AppUpdate(val versionCode: Long, val versionName: String, val minSdk:
             val apk = o.getJSONObject("apk")
             val update = AppUpdate(o.getLong("versionCode"), o.getString("versionName"), o.getInt("minSdk"),
                 o.getString("tag"), apk.getString("name"), apk.getLong("size"), apk.getString("sha256").lowercase(), o.optString("notes").take(1500))
-            require(update.versionCode in 1..Int.MAX_VALUE.toLong() && update.minSdk in 26..100)
+            // 这里发的是 minSdk 23 的包，所以下界是 23；上界只是防一个荒唐的值。
+            require(update.versionCode in 1..Int.MAX_VALUE.toLong() && update.minSdk in 23..100)
             require(update.versionName.matches(Regex("[0-9][0-9A-Za-z.+-]{0,63}")))
             require(update.tag.matches(Regex("kotlin-v[0-9][0-9A-Za-z.+-]{0,80}")))
             require(update.fileName.matches(Regex("hongguotv-kotlin-[0-9][0-9A-Za-z.+-]{0,80}-android6\\.apk")))
@@ -77,7 +84,9 @@ class AppUpdateRepository : java.io.Closeable {
         .callTimeout(5, TimeUnit.MINUTES).dns(PreferIpv4Dns()).addNetworkInterceptor { chain ->
             val url = chain.request().url
             // Follow GitHub's CDN redirects, never cleartext or arbitrary manifest-provided hosts.
-            if (url.scheme != "https" || url.host !in setOf("github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"))
+            // gh-proxy.com is the mirror the update URL is built on; it forwards to the same CDN
+            // hosts below, so the redirect chain still lands on an allowed host.
+            if (url.scheme != "https" || url.host !in setOf("gh-proxy.com", "github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"))
                 throw IOException("更新下载地址不受支持")
             chain.proceed(chain.request())
         }.build()

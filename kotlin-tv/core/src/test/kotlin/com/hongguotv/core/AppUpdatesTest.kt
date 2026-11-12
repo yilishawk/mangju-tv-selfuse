@@ -26,7 +26,7 @@ class AppUpdatesTest {
         assertTrue(update.newerThan(9, 26)); assertFalse(update.newerThan(10001, 36)); assertFalse(update.newerThan(10002, 36)); assertFalse(update.newerThan(9, 25))
     }
     @Test fun downloadUrlUsesOnlyFixedRepositoryAndValidatedNames() {
-        assertEquals("https://github.com/yilishawk/mangju-tv-selfuse/releases/download/kotlin-v0.9.0-build.1/hongguotv-kotlin-0.9.0-build.1-android6.apk", update().downloadUrl)
+        assertEquals("https://gh-proxy.com/https://github.com/yilishawk/mangju-tv-selfuse/releases/download/kotlin-v0.9.0-build.1/hongguotv-kotlin-0.9.0-build.1-android6.apk", update().downloadUrl)
         for (value in listOf("../../bad.apk", "evil.apk", "https://example.com/evil.apk", "hongguotv-kotlin-1/2-android6.apk")) {
             val o = json(); o.getJSONObject("apk").put("name", value)
             assertThrows(IllegalArgumentException::class.java) { AppUpdate.parse(o.toString()) }
@@ -83,8 +83,8 @@ class AppUpdatesTest {
     @Test fun theRepositoryIsThisProjectNotTheUnusedUpstream() {
         // 上游 miaoxiaohu/hongguoTV 只有源码、不挂 APK；只有本仓库的 release 才有 update.json。
         assertEquals("yilishawk/mangju-tv-selfuse", AppUpdate.REPOSITORY)
-        assertTrue(AppUpdate.RELEASES.startsWith("https://github.com/yilishawk/mangju-tv-selfuse/"))
-        assertEquals("https://github.com/yilishawk/mangju-tv-selfuse/releases/latest/download/update.json",
+        assertTrue(AppUpdate.RELEASES.startsWith("https://gh-proxy.com/https://github.com/yilishawk/mangju-tv-selfuse/"))
+        assertEquals("https://gh-proxy.com/https://github.com/yilishawk/mangju-tv-selfuse/releases/latest/download/update.json",
             "${AppUpdate.RELEASES}/latest/download/update.json")
     }
     @Test fun rejectOtherPackageAndInvalidSchema() {
