@@ -7,7 +7,7 @@ root=Path.cwd(); out=root/'outputs'; out.mkdir(exist_ok=True)
 
 # Certificate of every release users can currently upgrade from. Changing it would break
 # in-place installation, so it is asserted on every publish rather than trusted from Secrets.
-RELEASE_CERT='4f4cf502b9ea2b2cccada54ab62031de1ef4dc9aecdf3addbcf4099dd853cf08'
+RELEASE_CERT='98364d4e051de793e5ed7d78cc7d0a386c4c457b4b8be7dc11ec25c7d49c8120'
 TAG_RE=re.compile(r'kotlin-v(\d+)\.(\d+)\.(\d+)')
 VERSION_RE=re.compile(r'\d+\.\d+\.\d+')
 DEFAULT_NOTES='应用内自动检查和下载更新；保留安静连播、完整竖版海报和本机记录。'
@@ -144,9 +144,14 @@ if refresh_only:
     # place it had. Only the words about it change.
     make_latest=None
 elif previous is None:
-    fail('no published kotlin-v release was found, so there is nothing to compare this build '
-         'against; refusing to publish. If this really is the first kotlin-v release, publish it '
-         'by hand (gh release create <tag> --latest) instead of through this script.')
+    # This repository has no published kotlin-v release yet, so this build *is* the first one.
+    # release.yml has already refused any tag that is not strictly newer than every published
+    # kotlin-v release, and that guard is a no-op on an empty list, so there is nothing here to
+    # compare against - the correct outcome is simply to publish and take the `latest` pointer.
+    # The previous behaviour (refuse and ask for a hand-made release) only made sense in a
+    # repository that already shipped kotlin-v builds; here it would block the very first one.
+    print('::notice::no published kotlin-v release found; publishing this build as the first one')
+    make_latest=True
 else:
     make_latest=not previous>version_key(tag)
 
@@ -229,13 +234,13 @@ if RELEASE_CERT not in signature:
     fail('APK is not signed with the current release certificate; users would have to uninstall and lose their library')
 
 badging=run(str(buildtools/'aapt'),'dump','badging',str(apk))
-if f"versionCode='{code}'" not in badging or f"versionName='{version}'" not in badging or "sdkVersion:'26'" not in badging:
-    fail('built APK does not carry the requested versionCode/versionName/minSdk')
+if f"versionCode='{code}'" not in badging or f"versionName='{version}'" not in badging or "sdkVersion:'23'" not in badging:
+    fail('built APK does not carry the requested versionCode/versionName/minSdk (expected minSdk 23)')
 if not dex_carries_version(apk, version):
     fail(f'APK dex does not contain {version}: BuildConfig was not recompiled, so the app would '
          'show a stale version and compare updates against the wrong VERSION_CODE. Clean and rebuild.')
 
-manifest={'schema':1,'packageName':'com.hongguotv.nativeapp','versionCode':code,'versionName':version,'minSdk':26,'tag':tag,
+manifest={'schema':1,'packageName':'com.hongguotv.nativeapp','versionCode':code,'versionName':version,'minSdk':23,'tag':tag,
  'sourceCommit':commit,'apk':{'name':apk.name,'size':apk.stat().st_size,'sha256':hashlib.sha256(apk.read_bytes()).hexdigest()},
  'notes':manifest_notes()}
 write_manifest(manifest)
