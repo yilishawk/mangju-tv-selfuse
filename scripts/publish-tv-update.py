@@ -159,11 +159,11 @@ def release_body(version, code, commit):
     people, and it is the same text the television shows. The build facts are appended
     either way, because they are what a reader needs to reproduce the build.
     """
-    facts=f'''\n\n---\n\nAndroid 8.0+ 原生独立版，版本 {version}（versionCode {code}）。\n\n应用在前台浏览时每 6 小时检查一次新版，下载并校验文件与签名后提示安装；设置 → 版本与更新可手动检查或关闭自动下载。电视需允许本应用安装未知来源应用；普通 Android 8 仍需确认系统安装，并非静默安装。\n\n保留安静连播、完整竖版海报和所有本机记录。使用同一发布签名，可直接覆盖此前正式版。\n\n构建源码提交：{commit}。JVM 测试与 Release lint 通过后才发布。\n\n- APK：电视安装文件。\n- source.zip：与 APK 对应的完整原生源码，GPL-3.0。\n- update.json：电视更新元数据，含版本、文件长度与 SHA-256。\n- SHA256SUMS：附件校验和。\n\n复现发布构建时设置 HONGGUOTV_VERSION_CODE={code} 和 HONGGUOTV_VERSION_NAME={version}，并使用同一发布证书。Android 8 实体电视兼容性需实机确认。\n'''
+    facts=f'''\n\n---\n\nAndroid 6.0+ 原生独立版（minSdk 23，无原生 .so，arm64 / armeabi-v7a / x86 通用），版本 {version}（versionCode {code}）。\n\n应用在前台浏览时每 6 小时检查一次新版，下载并校验文件与签名后提示安装；设置 → 版本与更新可手动检查或关闭自动下载。电视需允许本应用安装未知来源应用；普通设备仍需确认系统安装，并非静默安装。\n\n保留安静连播、完整竖版海报和所有本机记录。使用同一发布签名，可直接覆盖此前正式版。\n\n构建源码提交：{commit}。JVM 测试与 Release lint 通过后才发布。\n\n- APK：电视安装文件。\n- source.zip：与 APK 对应的完整原生源码，GPL-3.0。\n- update.json：电视更新元数据，含版本、文件长度与 SHA-256。\n- SHA256SUMS：附件校验和。\n\n复现发布构建时设置 HONGGUOTV_VERSION_CODE={code} 和 HONGGUOTV_VERSION_NAME={version}，并使用同一发布证书。Android 6.0 实体设备兼容性需实机确认。\n'''
     file=release_notes_file()
     if file is not None:
         return file.read_text(encoding='utf-8').rstrip()+'\n'+facts
-    return f'''Android 8.0+ 原生独立版，版本 {version}（versionCode {code}）。\n\n{DEFAULT_NOTES}\n'''+facts
+    return f'''Android 6.0+ 原生独立版，版本 {version}（versionCode {code}）。\n\n{DEFAULT_NOTES}\n'''+facts
 
 def write_manifest(manifest):
     path=out/'update.json'
