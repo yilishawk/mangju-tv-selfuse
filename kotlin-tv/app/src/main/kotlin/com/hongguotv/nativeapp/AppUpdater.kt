@@ -67,7 +67,7 @@ class AppUpdater(private val activity: Activity, private val idle: () -> Boolean
         active = true; main.removeCallbacks(poll); main.postDelayed(poll, 8000)
         if (permissionRequested) {
             permissionRequested = false
-            if (activity.packageManager.canRequestPackageInstalls()) install()
+            if (canInstallFromUnknownSources()) install()
             else { status = "安装权限未开启，可在这里再次安装"; show(anchor) }
         }
     }
@@ -183,14 +183,32 @@ class AppUpdater(private val activity: Activity, private val idle: () -> Boolean
             candidate.applicationInfo?.minSdkVersion != update.minSdk || signers(installed).isEmpty() || signers(installed) != signers(candidate))
             throw IOException("新版包名、版本或签名不匹配，已阻止安装")
     }
+    /**
+     * Whether the installer can be launched right now.
+     *
+     * `PackageManager.canRequestPackageInstalls()` and the per-app "install unknown apps" screen
+     * behind it are API 26. Below that the switch is one system-wide setting with no per-app
+     * query, and the package installer itself asks for it, so the answer there is simply "try":
+     * a guard that called the API 26 method on Android 6 would throw NoSuchMethodError.
+     */
+    private fun canInstallFromUnknownSources(): Boolean {
+        if (Build.VERSION.SDK_INT < 26) return true
+        return activity.packageManager.canRequestPackageInstalls()
+    }
     private fun install() {
         val update = available ?: return
         if (busy || !active || !ready) return
         work({ validateApk(update) }) {
             try {
-                if (!activity.packageManager.canRequestPackageInstalls()) {
+                if (!canInstallFromUnknownSources()) {
                     permissionRequested = true
-                    activity.startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:${activity.packageName}")))
+                    // The per-app switch only exists on API 26+. Below that the branch above is
+                    // unreachable (the guard returns true), but naming the older system-wide
+                    // screen keeps the intent honest if that guard ever changes.
+                    val target = if (Build.VERSION.SDK_INT >= 26)
+                        Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:${activity.packageName}"))
+                    else Intent(Settings.ACTION_SECURITY_SETTINGS)
+                    activity.startActivity(target)
                 } else {
                     val uri = FileProvider.getUriForFile(activity, "${activity.packageName}.updates", apk)
                     activity.startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uri, "application/vnd.android.package-archive")
