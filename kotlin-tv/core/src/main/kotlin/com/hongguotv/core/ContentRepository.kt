@@ -1,0 +1,1674 @@
+// SPDX-License-Identifier: GPL-3.0-only
+package com.hongguotv.core
+
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.MediaType.Companion.toMediaType
+import org.json.JSONObject
+import org.json.JSONArray
+import org.json.JSONException
+import java.io.IOException
+import java.util.Locale
+import java.util.concurrent.TimeUnit
+
+internal fun JSONArray.objects() = (0 until length()).mapNotNull { optJSONObject(it) }
+internal fun JSONObject.str(key: String) = if (isNull(key)) "" else optString(key, "").trim()
+internal fun cleanUrl(s: String) = s.replace("\\/","/").replace("\\u002F","/",ignoreCase=true).replace("\\u0026","&").replace("&amp;","&")
+data class Series(val id: String, val title: String, val cover: String = "", val description: String = "", val badge: String = "", val tags: String = "") {
+    fun toJson() = JSONObject().put("id",id).put("title",title).put("cover",cover).put("description",description).put("badge",badge).put("tags",tags)
+    companion object { fun fromJson(o: JSONObject) = Series(o.str("id"),o.str("title"),o.str("cover"),o.str("description"),o.str("badge"),o.str("tags")) }
+}
+data class Detail(val series: Series, val episodes: List<String>)
+
+/** One season of a multi-season series, plus the season number parsed out of its title. */
+data class SeasonEntry(val series: Series, val season: Int)
+
+private val SEASON_MARK = Regex("[（(【\\[]?\\s*第\\s*([0-9一二三四五六七八九十百零两]+)\\s*季\\s*[）)】\\]]?")
+private val CN_DIGITS = mapOf('零' to 0,'一' to 1,'二' to 2,'两' to 2,'三' to 3,'四' to 4,'五' to 5,'六' to 6,'七' to 7,'八' to 8,'九' to 9)
+private val EMPTY_BRACKETS = Regex("[（(【\\[]\\s*[）)】\\]]")
+
+/** "第七季" -> 7, "（第二季）" -> 2; null when the title carries no season marker. */
+internal fun seasonNumber(title: String): Int? {
+    val raw = SEASON_MARK.find(title)?.groupValues?.get(1) ?: return null
+    raw.toIntOrNull()?.let { return it.takeIf { n -> n > 0 } }
+    // 中文数字。写法只有「十二」「二十」「一百零二」这类，简繁通用的十/百进位即可。
+    var total = 0
+    var digit = -1          // 尚未遇到进位字前累积的数字
+    var seen = false
+    for (ch in raw) {
+        when {
+            ch == '百' -> {
+                val head = if (digit >= 0) digit else 1     // 「百」前无数字时按「一百」理解
+                total += head * 100
+                digit = -1; seen = true
+            }
+            ch == '十' -> {
+                val head = if (digit >= 0) digit else 1     // 「十二」=12，「二十」=20
+                total += head * 10
+                digit = -1; seen = true
+            }
+            ch in CN_DIGITS -> {
+                val d = CN_DIGITS[ch] ?: return null
+                // 「零」在「一百零二」里只是占位，不占数位；其它数字重复出现则非法。
+                if (d == 0) { seen = true; continue }
+                if (digit >= 0) return null                 // 「一二三」不是合法数字
+                digit = d; seen = true
+            }
+            else -> return null
+        }
+    }
+    if (!seen) return null
+    val n = total + if (digit >= 0) digit else 0
+    return n.takeIf { it > 0 }
+}
+
+/** Strip the season marker so all seasons of one show collapse onto the same base title. */
+internal fun seriesBaseTitle(title: String): String =
+    title.replace(SEASON_MARK, "").replace(EMPTY_BRACKETS, "").replace(Regex("\\s+"), " ").trim()
+
+/** Whitespace and punctuation carry no meaning when looking for a show by name. */
+private val SEARCH_NOISE = Regex("[\\s\\p{P}\\p{S}]+")
+
+/** Lowercase, with whitespace and punctuation removed. */
+internal fun normalizeForSearch(value: String) = SEARCH_NOISE.replace(value.lowercase(Locale.ROOT), "")
+
+/**
+ * Does [title] actually mention [keyword]?
+ *
+ * The site's search never says no. Searching a show it does not carry still answers with ten
+ * popular rows of the same genre, and it reports a `totalCount` of 174-210 for such a term as if
+ * it had matched something - so 「庆余年」 comes back as 《剑神归来》《零下五十度我被困在公司》,
+ * with nothing in the ten rows containing the term. Search is fuzzy ranking over a fixed list of
+ * ten, never a filter, and the client has to draw that line itself.
+ *
+ * Punctuation is ignored because no one retypes a title's punctuation exactly: 搜「伪人降临 我是
+ * 全场唯一预言家第三季」from a phone lands on 「伪人降临！我是全场唯一预言家第三季」.
+ */
+internal fun mentions(title: String, keyword: String): Boolean {
+    val needle = normalizeForSearch(keyword)
+    return needle.isNotEmpty() && needle in normalizeForSearch(title)
+}
+
+/**
+ * Does this row answer what the user asked?
+ *
+ * The ordinary rule is that the row's title has to contain the word: the site answers every
+ * query with ten confident same-genre rows, and the client has to draw that line itself.
+ *
+ * The rule bends once, for a word the site will not take. The site caps a query at thirty
+ * characters - measured 2026-10-23, a longer one comes back `400 invalid_query`, "Provide one
+ * non-empty search query of at most 30 characters" - so a long word has to be cut before it
+ * is sent. The cut word is longer than any title that could answer it, because the title is
+ * the *beginning* of it, so the ordinary rule can never hold and nothing would ever match.
+ *
+ * A title that sits inside the word the user typed does answer it: the user typed the show's
+ * title and more, and the site answered with the show. Measured the same day - the forty
+ * character query 「我在末世打脸女主了第二季番外篇全集高清无删减完整版在线观看…」 comes back
+ * 400 as it stands, and cut to thirty it answers with 《我在末世打脸女主了》.
+ */
+internal fun answers(title: String, keyword: String, truncated: Boolean): Boolean {
+    if(mentions(title,keyword)) return true
+    if(!truncated) return false
+    val needle=normalizeForSearch(keyword)
+    val candidate=normalizeForSearch(title)
+    return candidate.isNotEmpty() && candidate in needle
+}
+data class RankPosition(val rank: Int?, val heat: String)
+data class HotRanking(val positions: Map<String,RankPosition>, val totalPages: Int, val updatedText: String)
+
+/**
+ * What happened to the site's own ten rows.
+ *
+ * The two failures are not the same to the person searching, and telling them apart is the
+ * whole point. 「暂时不可用」 means a moment: the network hiccuped, the CDN answered 502, and
+ * the same question works again in a minute. 「用不了」 means the site did answer and the
+ * answer cannot be used - it refused the query, or it answered with a shape this client does
+ * not read. Calling that 「暂时」 sends the user off to wait for something that is not coming
+ * back on its own.
+ *
+ * Measured 2026-10-23 over roughly two hundred requests against the live endpoint: a 502
+ * shows up about once in a hundred, while a refusal is standing. So the first is worth
+ * waiting for and the second is worth saying out loud.
+ */
+enum class ServerSearchProblem {
+    /** The site's rows were fetched. */
+    NONE,
+    /** No answer at all: the network, a timeout, or a 5xx. */
+    UNAVAILABLE,
+    /** An answer that cannot be used: a refusal, or a shape this client does not read. */
+    REJECTED,
+}
+/**
+ * [matchedCount] is how many of [items] the keyword actually found, [totalHits] how many exist in
+ * total across pages, and [fuzzy] whether that came from the one-character typo fallback. All three
+ * are null / false where the page is not a search result and the questions do not apply.
+ *
+ * [totalPages] is how many pages the whole listing has, when the site says so. It is the one
+ * number the app cannot work out for itself: a page of a browse list holds a fixed number of
+ * rows, but the rows a page of the site holds are the site's business (measured 2026-10-20: 24 a
+ * page, 34 pages for every route), and the app draws the browsed rows in a grid of its own width.
+ * Counting pages from the rows on screen would therefore count the app's pages, not the site's,
+ * and the two must not be mixed up - see [routePage] and [home].
+ */
+data class CatalogPage(
+    val items: List<Series>,
+    val hasMore: Boolean,
+    val ranking: HotRanking? = null,
+    val matchedCount: Int? = null,
+    val totalHits: Int? = null,
+    val fuzzy: Boolean = false,
+    val totalPages: Int? = null,
+    /**
+     * 站方那一路取不到了。
+     *
+     * 搜索的主体是本机索引（2400 部都在里面），站方那十行只是**补位** —— 补的是站上有、
+     * 索引里还没有的新剧。所以它取不到的时候，搜索照样能用，只是少了那十行。
+     *
+     * 2026-10-22 实测：站方把搜索页改成了纯前端渲染（首页、分类页、榜单页仍然服务端渲染），
+     * HTML 里不再有 `_ROUTER_DATA`，于是那十行取不到了。此前它一失败，整页就变成
+     * 「暂时无法加载」—— 本机索引里明明已经有一千多条命中。
+     *
+     * 取不到有两种，界面上得说不一样的话：见 [ServerSearchProblem]。
+     */
+    val serverProblem: ServerSearchProblem = ServerSearchProblem.NONE
+) {
+    /** 站方那十行是不是没拿到。 */
+    val serverFailed: Boolean get() = serverProblem != ServerSearchProblem.NONE
+}
+/**
+ * A playable stream.
+ */
+data class StreamInfo(val url: String, val key: ByteArray?, val quality: String)
+class SearchSessionExpiredException: IOException("搜索结果已过期，请从第 1 页重新搜索")
+
+/**
+ * The site answered, but with a shape this client does not read.
+ *
+ * A standing failure, unlike a timeout or a 502: the site's search page moved on and this
+ * client was left behind. Waiting does not bring the old shape back, so the interface says
+ * 「用不了」 rather than 「暂时不可用」.
+ */
+class SearchShapeChangedException: IOException("搜索数据结构已变化")
+
+/** Carries the status code so callers can explain a 404 instead of showing a bare error. */
+class HttpStatusException(val code: Int): IOException("内容请求失败（HTTP $code）")
+
+/**
+ * The signed player endpoint answered HTTP 200 with an empty body.
+ *
+ * Measured 2026-10-27: the same signed request for the same episode, with the same device
+ * identity and the same signature, answers with a zero-byte body on roughly half of the attempts
+ * and with a full ~22 KB payload on the others. The answer does not depend on the episode, on
+ * the identity, on HTTP/1.1 vs HTTP/2, or on the interval between the attempts - so it is the
+ * endpoint refusing an attempt, not a different episode or a throttled client.
+ *
+ * An empty body is the one failure the signed path can walk away from: another attempt of the
+ * same request is answered properly about half the time, so asking again is worth more than
+ * any other road.
+ */
+class EmptySignedAnswerException: IOException("播放接口返回空内容")
+
+/**
+ * The public player page does not host this episode.
+ *
+ * The public page only carries the first three episodes of a show, so its 404 says something
+ * about the page, not about the episode: the episode may well be playable through the signed
+ * path. The two have to stay apart, because only the signed path can play the fourth episode and
+ * onwards.
+ */
+class PublicPageHasNoEpisodeException: IOException("该来源每部剧只提供前 3 集，本集暂无资源")
+
+/**
+ * The anonymous device could not be registered, and the attempt is not repeated for a moment.
+ *
+ * This is the failure that used to turn a ten-second outage into a minute of "play ten seconds,
+ * fail, retry". The registration stalled, the attempt was given up on, and every attempt inside
+ * the retry window then reported the *absence* of an identity - which is not a network failure,
+ * so the fallback walked on to the public page. That page hosts the ten-second sample, so the
+ * box played ten seconds of 360p, said "failed", and did it again.
+ *
+ * The exception says exactly what it is, so the fallback can tell it apart from a refusal and
+ * stay where it is: without an identity the public page can only offer the sample.
+ */
+/**
+ * The playback device could not be registered.
+ *
+ * [retryAfterMs] is how long the attempt is not repeated, and [reason] says what happened in
+ * words the person in front of the set can act on: the site refusing to hand out a device is a
+ * different thing from the network being down, and the two want opposite answers.
+ */
+class RegistrationUnavailableException(val retryAfterMs: Long = 0L, val reason: String = ""): IOException(if(reason.isEmpty()) "播放设备注册未成功，请稍后重试" else reason)
+
+/**
+ * The source answered with the ten-second sample instead of the episode.
+ *
+ * The public page hosts `video/public/<id>/360p.mp4`, and that file is ten seconds long
+ * (measured 2026-11-01: exactly 10.000 s, 1,057,426 bytes) - a preview, not the episode. It
+ * used to be handed to the player as if it were the episode, which played for ten seconds and
+ * then reported a playback failure.
+ */
+class SampleClipException(val sampleMs: Long): IOException("只取到 ${sampleMs/1000} 秒试看片段，不是完整剧集")
+
+/**
+ * The address lookup did not produce an address to play.
+ *
+ * The person is looking at 「正在获取播放地址…」 while this happens, so the wording of the
+ * failure matters: it is not "the network is broken" and not "try another quality" - the next
+ * thing that helps is another attempt at the address.
+ */
+class AddressLookupException(val timedOut: Boolean,cause: Throwable): IOException(if(timedOut) "获取播放地址超时" else "获取播放地址失败",cause)
+
+/**
+ * How many board pages one shelf may have.
+ *
+ * The site publishes five for every board and answers 404 on the sixth - measured 2026-10-19 for
+ * all four boards. The bound is a safety net rather than a known number: a board that suddenly
+ * grew must not turn into an endless walk.
+ */
+private const val MAX_RANK_PAGES = 50
+
+class ContentRepository(val http: OkHttpClient = playbackHttpClient(), private val clock: () -> Long = System::currentTimeMillis) {
+    private val signer = Signer()
+    private val site = "https://hongguoduanju.com"
+    /** The boards already fetched, per shelf, so turning the page costs nothing. */
+    private val rankingCache=mutableMapOf<ContentType,HotRank.HotList>()
+    /**
+     * The transport for one playback attempt's address lookup.
+     *
+     * Derived from [http], so an injected client (and the interceptors on it) still applies, but
+     * with the deadlines an address lookup should have: see [addressHttpClient].
+     */
+    private val addressHttp=addressHttpClient(http)
+    /**
+     * The transport one registration attempt uses.
+     *
+     * The registration gets its own leash because it is a once-per-session request that the
+     * whole playback path depends on. Measured 2026-11-01 on the TV: the connection to the
+     * registration host stalled for 10.04 s and 15.03 s and the answer that finally came was
+     * 155 ms past the ten-second deadline the address lookup used - so a request that would
+     * have succeeded was killed, and the box was left without an identity.
+     *
+     * Twenty seconds covers both stalls that were measured and still ends the wait for a
+     * registration that is never going to answer.
+     */
+    private val registrationHttp=addressHttpClient(http).newBuilder()
+        .callTimeout(REGISTRATION_CALL_TIMEOUT_S,TimeUnit.SECONDS).build()
+    /**
+     * The registered playback identity, and the moment the last registration attempt failed.
+     *
+     * The identity belongs to this repository rather than to a process-wide singleton: the app
+     * makes one repository for the whole session, so the device is registered once either way,
+     * but a test that makes a repository of its own cannot inherit another test's identity.
+     *
+     * A failed registration is not retried for a few seconds. It is not remembered as a failure -
+     * it is only not retried - so that a playback attempt does not turn into a registration
+     * attempt every time the person turns the set on. The window used to be a minute, and a
+     * minute is long enough for every attempt inside it to be answered with the sample.
+     */
+    @Volatile private var registeredIdentity: PlaybackIdentity?=null
+    @Volatile private var registrationFailedAt=0L
+    /**
+     * The moment until which the site is left alone.
+     *
+     * Measured 2026-11-05: the registration endpoint answers HTTP 200 with `device_id` and
+     * `install_id` both zero - it is not handing out a device to this client right now. Asking
+     * again immediately does not help and piles the requests up on the same limit, so a refusal
+     * is backed off for minutes rather than seconds.
+     */
+    @Volatile private var registrationRefusedUntil=0L
+    /**
+     * The addresses already looked up, and when each of them was looked up.
+     *
+     * One registered identity buys one signed request, and that request can carry a whole
+     * window of episodes - so the addresses that come back are worth keeping. A person who
+     * watches three episodes in a row then pays for one registration, not three.
+     */
+    private val addressCache=LinkedHashMap<String,CachedAddress>()
+
+    /**
+     * Registers one anonymous device, or hands back the one this repository already has.
+     *
+     * @throws IOException when the registration cannot be made or does not answer with the two
+     *   numbers the playback request needs.
+     */
+    @Synchronized private fun playbackIdentity(): PlaybackIdentity {
+        registeredIdentity?.let { return it }
+        val now=clock()
+        // The site refused to hand out a device: that window is minutes long, not seconds.
+        if(registrationRefusedUntil>now) throw RegistrationUnavailableException(registrationRefusedUntil-now,REGISTRATION_REFUSED_REASON)
+        if(registrationFailedAt>0 && now-registrationFailedAt<PLAYBACK_REGISTRATION_RETRY_MS) {
+            // The window is measured from the moment the attempt *failed*, not from the moment it
+            // started: an attempt that took twenty seconds to fail has already spent its window.
+            // What is left of it travels with the exception, so the caller does not knock again
+            // before the window is over.
+            throw RegistrationUnavailableException(PLAYBACK_REGISTRATION_RETRY_MS-(now-registrationFailedAt))
+        }
+        val identity=try { registerIdentity(now) }
+        catch(e: Exception) {
+            registrationFailedAt=clock()
+            // A refusal is not a network hiccup: it is the site saying it is not handing out
+            // devices to this client right now, and the answer to that is to wait, not to ask
+            // again. Asking again is what makes the limit last longer.
+            if(isRegistrationRefused(e)) {
+                registrationRefusedUntil=clock()+PLAYBACK_REGISTRATION_REFUSED_BACKOFF_MS
+                throw RegistrationUnavailableException(PLAYBACK_REGISTRATION_REFUSED_BACKOFF_MS,REGISTRATION_REFUSED_REASON)
+            }
+            throw e
+        }
+        registeredIdentity=identity
+        registrationFailedAt=0
+        return identity
+    }
+    /**
+     * One registration attempt, and a second one on a fresh connection when the first stalled.
+     *
+     * A connection that stalled does not come back by being asked again on the same socket. The
+     * pooled connections are thrown away and the request goes out again: the name is resolved
+     * anew, and the new attempt can land on another edge - which is what happened on the TV,
+     * where a connection to one edge sat still for ten seconds while a new connection to
+     * another was answered in 215 ms.
+     *
+     * Only a stall earns the second attempt. A connection that was refused is talking to a host
+     * that is not there, and the answer would be the same one more time.
+     */
+    private fun registerIdentity(now: Long): PlaybackIdentity {
+        try { return PlaybackDevice.register(registrationHttp,now) }
+        catch(first: Exception) {
+            if(!isTimeoutFailure(first)||isCancellation(first)) throw first
+            http.connectionPool.evictAll()
+            try { return PlaybackDevice.register(registrationHttp,now) }
+            catch(second: Exception) { second.addSuppressed(first); throw second }
+        }
+    }
+    /**
+     * Whether the registration was refused rather than broken.
+     *
+     * A refusal is the site saying it is not handing out a device to this client right now; a
+     * broken connection is the network. The two want opposite answers: one wants a wait, the
+     * other wants a retry.
+     */
+    private fun isRegistrationRefused(error: Throwable): Boolean {
+        var cause: Throwable?=error
+        while(cause!=null) {
+            if(cause is PlaybackRegistrationRefusedException) return true
+            cause=cause.cause
+        }
+        return false
+    }
+    /**
+     * One address lookup, and a second one on a fresh connection when the first died of the network.
+     *
+     * A connection that stalled does not come back by being asked again on the same socket. The
+     * pooled connections are thrown away and the request goes out again: the name is resolved
+     * anew, and the new connection can land on another edge. Measured on the TV, 2026-11-01: the
+     * old connection to one edge sat still for 10.04 s and 15.03 s, while a new connection to
+     * another edge was answered in 215 ms.
+     */
+    private fun <T> addressLookup(ask: (OkHttpClient) -> T): T {
+        try { return ask(addressHttp) }
+        catch(first: Exception) {
+            if(!isTimeoutFailure(first)||isCancellation(first)) throw first
+            http.connectionPool.evictAll()
+            try { return ask(addressHttp) }
+            catch(second: Exception) { second.addSuppressed(first); throw second }
+        }
+    }
+    private fun text(url: String, signed: Signer.Request? = null, client: OkHttpClient = http): String {
+        val request = Request.Builder().url(url).header("User-Agent",VendorConstants.VIDEO_UA).header("Accept-Language","zh-CN,zh;q=0.9")
+        signed?.headers?.forEach { (k,v) -> request.header(k,v) }
+        signed?.body?.let { request.post(it.toRequestBody("application/json; charset=utf-8".toMediaType())) }
+        return RequestScope.execute(client.newCall(request.build())) { response ->
+            if (!response.isSuccessful) throw HttpStatusException(response.code)
+            val body = response.body ?: throw IOException("内容响应为空")
+            if (body.contentLength() > 16*1024*1024) throw IOException("内容响应过大")
+            val input=body.byteStream(); val out=java.io.ByteArrayOutputStream(); val buffer=ByteArray(8192)
+            while(out.size()<=16*1024*1024) { val n=input.read(buffer); if(n<0) break; out.write(buffer,0,n) }; val bytes=out.toByteArray()
+            if(bytes.size > 16*1024*1024) throw IOException("内容响应过大")
+            String(bytes,Charsets.UTF_8)
+        }
+    }
+    private fun router(url: String) = extractRouter(text(url)).getJSONObject("loaderData")
+    private fun card(item: JSONObject): Series {
+        val o=item.optJSONObject("video_data") ?: item
+        val count=o.optInt("episode_cnt",o.optJSONObject("series_episode_info")?.optInt("episode_cnt",0) ?: 0)
+        val tags=o.optJSONArray("tags") ?: o.optJSONArray("category_list") ?: JSONArray()
+        return Series(o.str("series_id"),o.str("series_name").ifEmpty { o.str("series_title").ifEmpty { item.str("name") } },cleanUrl(o.str("series_cover")),o.str("series_intro"),o.str("episode_right_text").ifEmpty { if(count>0) "全 ${count} 集" else "" },(0 until minOf(tags.length(),5)).joinToString(" · ") { tags.optJSONObject(it)?.str("name") ?: tags.optString(it) })
+    }
+    private fun valid(rows: List<Series>) = rows.filter { it.id.matches(Regex("[0-9]{1,30}")) && it.title.isNotBlank() }.distinctBy { it.id }
+    /**
+     * The hot list of one shelf.
+     *
+     * The board serves twenty rows a page and has no page-size parameter to change that - measured
+     * 2026-10-19, ten spellings (pageSize, page_size, size, limit, rows, count, per_page, num and
+     * combinations), all twenty. Twenty is not a multiple of the app's six columns, so a page
+     * drawn straight from the board always ends with a short row - the thing the rest of the app
+     * avoids by making its own pages a multiple of the row width. The app therefore cuts its pages
+     * out of this list with [HotRank.page].
+     *
+     * The list itself is every board of the shelf's routes, merged into one heat order, because
+     * the heat is a per-show number that reads the same on every board. Merging the whole list is
+     * also what makes the ranks mean anything: the comic board's number 21 is hotter than the AI
+     * board's number 30, so without one order the 「第 41 名」 on the second screen can be hotter
+     * than the 「第 40 名」 on the first - measured 2026-10-19, 5437万 on the first screen's last
+     * card against 5500万 on the second screen's first.
+     *
+     * Fetching the whole shelf is the only way to get one order out of it: five requests for 真人剧,
+     * ten for 漫剧 (two boards), two seconds measured. The list is held for the session, so turning
+     * the page costs nothing more.
+     *
+     * A board that fails does not take the whole tab down: the rest still lists, and the shelf's
+     * hot list is shorter rather than missing. Only every board failing is a failure.
+     *
+     * @param force fetch even when a list fetched recently is already held.
+     */
+    @Synchronized
+    fun rankingList(type: ContentType = ContentType.SHORT, force: Boolean = false): HotRank.HotList {
+        val now=System.currentTimeMillis()
+        rankingCache[type]?.let { if(!force && !it.isStale(now)) return it }
+        var failure: Exception?=null
+        val boards=mutableListOf<HotRank.Board>()
+        for(route in type.routes) {
+            var page=1
+            while(page<=MAX_RANK_PAGES) {
+                val board=try { HotRank.parse(text("$site/rank/${route.rankPath}?page=$page"),page,route) }
+                catch(e: Exception) { if(failure==null) failure=e; break }
+                if(board.items.isEmpty()) break
+                boards+=board
+                if(page>=board.totalPages) break
+                page++
+            }
+        }
+        if(boards.isEmpty()) throw failure ?: IOException("热播榜暂不可用")
+        val list=HotRank.combine(boards,type)
+        rankingCache[type]=list
+        return list
+    }
+    /**
+     * Throws the fetched boards away, so the next request goes to the site again.
+     *
+     * Synchronized for the same reason [rankingList] is: it empties the very map that method
+     * reads and writes, and a plain [LinkedHashMap] being emptied while another thread walks it
+     * is not a safe thing to do.
+     */
+    @Synchronized fun clearRankingCache() { rankingCache.clear() }
+    /**
+     * One route's page, exactly as the site serves it.
+     *
+     * The walk consumes this, one route at a time, because each route has its own page count and
+     * its own bookmark. Browsing does not: a type is browsed as the whole of it, which is
+     * [home]'s job.
+     *
+     * The page count the site reports is carried along, because the app cannot work it out for
+     * itself: a browsed page is drawn in a grid of the app's own width, so the rows on screen
+     * say nothing about how many pages the site has. Measured 2026-10-20: 24 rows a page and 34
+     * pages for every route (800 shows).
+     */
+    fun routePage(page: Int = 1, route: Route = Route.REAL_DRAMA): CatalogPage {
+        require(page in 1..100)
+        val data=router("$site/category/${route.categorySlug}"+if(page>1) "?page=$page" else "")
+        val section=data.optJSONObject("category_page") ?: data.optJSONObject("category_$") ?: throw IOException("首页数据结构已变化")
+        val rows=section.optJSONArray("recommendList") ?: section.optJSONObject("categoryData")?.optJSONArray("recommendList") ?: throw IOException("首页数据暂不可用")
+        val items=valid(rows.objects().map(::card))
+        val lastPage=section.optJSONObject("pagination")?.optInt("totalPages",100) ?: 100
+        val totalPages=minOf(lastPage,100)
+        return CatalogPage(items,items.isNotEmpty() && page<totalPages,totalPages=totalPages)
+    }
+    /**
+     * Browse one of the catalogues the user picks, named by [ContentType].
+     *
+     * The retired `?tab=1&sort_type=1` browse path only ever reached 874 shows, and `sort_type` is
+     * inert there anyway — 0/1/2/3/4 all answer with byte-identical first pages, so there was no
+     * "newest first" ordering to ask for. The named routes are the site's real navigation.
+     *
+     * A type can be served by more than one route: 漫剧 is `comic-drama` **and** `ai-drama`, and
+     * browsing 漫剧 shows both shelves. Each route keeps its own ordering, and they are concatenated
+     * rather than interleaved — the first shelf's own "hot" list stays the first thing on screen, and
+     * the second shelf follows it on the same page instead of 34 pages later.
+     *
+     * The hot board deliberately no longer hangs off this function: it is reached through
+     * [ranking] alone, so browsing a category and reading a ranking stay separate views
+     * instead of one silently replacing the other.
+     */
+    fun home(page: Int = 1, type: ContentType = ContentType.SHORT): CatalogPage {
+        require(page in 1..100)
+        // 漫剧这一档由两条货架拼成，其中一条挂掉时不该把整页变成空白：能拿多少算多少，
+        // 页面照样能翻。只有两条都失败，才算这次请求失败。
+        var failure: Exception?=null
+        val pages=type.routes.mapNotNull { route ->
+            try { routePage(page,route) } catch(e: Exception) { if(failure==null) failure=e; null }
+        }
+        if(pages.isEmpty()) throw failure ?: IOException("首页数据暂不可用")
+        val items=pages.flatMap { it.items }.distinctBy { it.id }
+        // 同一档的两条货架是齐步走的：一条走完了，这一页就不完整了。所以总页数取短的那条 ——
+        // 再往后还能看到长出来的那条，可那不是这一档的完整一页。
+        // 站方今天给三条货架报的都是 34 页（实测 2026-10-20，800 部，一页 24 条），取短的那条
+        // 不改变今天的数字，但它写的是那条规则，而不是今天恰好相等。
+        val totalPages=pages.mapNotNull { it.totalPages }.minOrNull()
+        // 「还有下一页」和「一共有几页」必须是同一个数。不然页码选择器能翻到的最后一页，
+        // 和「下一页」按到底的那一页，会打起来。
+        val hasMore=if(totalPages!=null) items.isNotEmpty() && page<totalPages
+            else items.isNotEmpty() && pages.any { it.hasMore }
+        return CatalogPage(items,hasMore,totalPages=totalPages)
+    }
+    /**
+     * Search the whole catalogue locally when an index is available, otherwise through the public page.
+     *
+     * The public page is the only source that still answers, and it answers with ten rows and no
+     * way to ask for more: `?page=` and sixteen other paging names return byte-identical pages,
+     * the page's JavaScript bundle makes no API call of its own, and the signed App endpoint
+     * `reading/bookapi/search/tab/v/` returns HTTP 200 with a zero-byte body for every parameter
+     * shape tried while `video_model/v1/` returns 24 KB in the same process. So the public page
+     * alone is a ten-row ceiling no client change can lift - see [CatalogueIndex], which is built
+     * from the catalogue pages that *do* work and turns ten rows into the full 2400.
+     *
+     * The server is still asked once per search, and whatever it returns that the index has never
+     * seen is appended when the page has room. That keeps newly listed shows reachable without
+     * letting ten unranked rows outrank a local exact match.
+     *
+     * Two server paths are used, and the difference between them is the whole reason a show
+     * listed today is findable at all: the search-result path ranks by popularity and only hits
+     * the show when the word is its whole title, while the suggestion path ranks by show name and
+     * hits it on a fragment — measured 2026-10-24 on 《我刚穿越，校花竟是重生女帝》, which the
+     * result path does not return on any of its 22 pages for 「我刚穿越」 or 「校花竟是重生女帝」,
+     * and the suggestion path puts first for both. See [siteRows].
+     *
+     * [type] narrows the local index to one catalogue, and only when [local] can actually classify
+     * its shows — see [CatalogueIndex.labelled]. It cannot narrow the server: the public search page
+     * accepts no category parameter at all. That is not a loss in practice, because the server only
+     * ever contributes ten top-up rows while the index answers with every match in the library.
+     * Measured over the whole library on 2026-10-19 (2400 shows: 800 真人剧, 1600 漫剧),
+     * 「都市」 hits 1042 shows of which 670 are 漫剧, so without the split most of what a genre
+     * search wanted is mixed in with the other shelf. The three routes are disjoint, so the
+     * split itself is clean.
+     *
+     * [CatalogPage.matchedCount] records how many rows actually mention the keyword. It is not a
+     * nicety: the site answers every query with ten rows and never an empty list, so 「站内没有这部
+     * 剧」 can only be decided client-side — see [mentions].
+     */
+    fun search(keyword: String, page: Int = 1, type: ContentType = ContentType.SHORT, local: CatalogueIndex? = null): CatalogPage {
+        require(keyword.isNotBlank() && keyword.length<=80 && page in 1..100)
+        // 站方的搜索接口只收 30 个字（2026-10-23 实测：超了回 400 invalid_query，
+        // "Provide one non-empty search query of at most 30 characters"）。超长的话只能截。
+        //
+        // 截的是**问站方的那一句**，不是用户打的那一句：本机索引是我们自己的数据，没有这个限制。
+        // 两侧各走各的路 —— 本机这一侧认「剧名是这几个字的开头」（[CatalogueIndex] 的 loose），
+        // 站方答回来的行按 [answers] 判是不是命中。
+        val siteKeyword=keyword.take(SITE_QUERY_LIMIT)
+        val truncated=siteKeyword.length<keyword.length
+        var fuzzy=false
+        val localRows = if(local==null) emptyList() else local.searchAllowingTypo(keyword,SEARCH_LOCAL_LIMIT,type,truncated).let { (rows,relaxed) -> fuzzy=relaxed; rows }
+        // 命中的总数要单独数一遍，不能从手上这份列表数出来。列表是给一页用的，总数是给
+        // 「第 X/Y 页 · 共 N 部」用的，两者的口径必须一致 —— 之前总数是列表长度，而列表被
+        // 截断过，于是「都市」明明命中 1042 部却写成「共 400 部」，翻过 13 页之后剩下的
+        // 600 多部再也走不到，翻页还会撞上一张「没有找到相关剧」的空白页。
+        // 命中为零时走的是错字容错，那份列表才是用户看到的，所以总数就取它。
+        val localTotal=if(local==null) 0 else if(fuzzy) localRows.size else local.count(keyword,type,truncated)
+        // The server is asked on page one only. Its ten rows merely top up a page that the local
+        // index has not filled, so re-asking on page two would spend a request to return rows that
+        // are already merged in - and with no index at all it would spend one to answer nothing.
+        //
+        // 取不到就算了，不能把整页拖下水：它只是补位，搜索的主体是本机索引。
+        // 2026-10-22 实测站方把搜索页改成了纯前端渲染，这一路已经取不到了（首页/分类/榜单仍正常）。
+        // 之前它一失败，整页就变成「暂时无法加载」，而本机索引里明明有上千条命中。
+        //
+        // 但「取不到」有两种，界面上不能都叫「暂时」：见 [ServerSearchProblem]。
+        //
+        // 站方有两条路：搜索结果（十条同类热门）和联想建议（按剧名找）。索引没答上来的时候
+        // 两条都问 —— 索引答不上来的时候，多半正是站上新剧还没被走查收进去的时候，
+        // 而搜索结果那一条路对半截词是找不到它的（见 [siteRows]）。
+        var serverProblem=ServerSearchProblem.NONE
+        val serverRows=if(page==1) try { siteRows(siteKeyword,localRows.isEmpty()) }
+        catch(e: Exception) { serverProblem=classifyServerFailure(e); emptyList() }
+        else emptyList()
+        // 分类过滤只在索引真能分类时才生效。索引里的每部剧都记着自己属于哪套目录，才谈得上
+        // 「只看漫剧」；索引还欠着标签时（刚装上、或正在补建），硬过滤会把服务端的补位行全判成
+        // 「不属于真人剧」而丢掉，搜什么都不出东西 —— 一个看起来生效、实际把人全筛没了的开关，
+        // 比没有这个开关更糟。所以这里退回不过滤，界面上另有交代。
+        //
+        // 索引里根本没有的那些行同样不能丢。站方搜索能搜到的剧，比本机走查得到的多：走查只覆盖
+        // 三条分类目录共 2400 部，而《回到心跳开始时》在站方搜索里是第一行，在这 2400 部里一部
+        // 都没有（2026-10-19 实测）。这类剧只有站方搜索这一条路，索引永远装不下它；把它按
+        // 「不属于当前分类」筛掉，等于让这部剧从此搜不到 —— 恰恰是过滤最不该做的事。
+        // 索引判不出来的行一律留下：分类过滤只筛索引能分类的行，判不出来的就别替它下结论。
+        // （type 是非空的，所以这里没有 type==null 这一说；编译器本来就在报它恒为 false。）
+        val scoped = if(local?.labelled!=true) serverRows else serverRows.filter { row -> local.routeOf(row.id)?.let { it.type==type } ?: true }
+        val known = localRows.mapTo(HashSet()) { it.id }
+        val unseen = scoped.filterNot { it.id in known }
+        // A local hit has to stay alone: 搜「雾锁情迷」finds exactly one show, and topping the page
+        // up with the server's fuzzy rows would bury nine unrelated dramas under it. When the index
+        // finds nothing at all those rows are the only thing left to show, and they are shown whole
+        // under the 「以下是同类推荐」 notice instead.
+        val filler = if(localRows.isEmpty()) unseen else unseen.filter { answers(it.title,keyword,truncated) }
+        val window = when {
+            // No index, or the index matched nothing: the server rows are all there is.
+            // 命中的排前面，同类推荐排后面。站方搜索结果那一条路给的是十条同类热门，
+            // 而新剧常常只在联想建议那一行里 —— 排在十条不相干的后面，就等于没有。
+            localRows.isEmpty() -> if(page>1) emptyList() else {
+                val hits=scoped.filter { answers(it.title,keyword,truncated) }
+                val hitIds=hits.mapTo(HashSet()) { it.id }
+                hits + scoped.filterNot { it.id in hitIds }
+            }
+            else -> {
+                val slice = localRows.drop((page-1)*SEARCH_PAGE_SIZE).take(SEARCH_PAGE_SIZE).toMutableList()
+                // Only the first page borrows room from the server, so paging never drifts between
+                // two different orderings.
+                if(page==1 && slice.size<SEARCH_PAGE_SIZE) slice += filler.take(SEARCH_PAGE_SIZE-slice.size)
+                slice
+            }
+        }
+        val hasMore = localTotal > page*SEARCH_PAGE_SIZE
+        // A local hit counts even when the word is only in the tags — 《雾锁情迷》 carries a
+        // 「总裁」 tag — otherwise the tab would claim 「站内没有《总裁》」 while listing exactly
+        // the shows that matched it.
+        val matched = localTotal + filler.count { answers(it.title,keyword,truncated) }
+        // What paging will walk in total. Server filler is counted only on page one, where it is
+        // actually merged in, so the number does not change as the user turns pages.
+        val total = localTotal + if(page==1) filler.size else 0
+        return CatalogPage(window.distinctBy { it.id },hasMore,null,matched,total,fuzzy,serverProblem=serverProblem)
+    }
+    /**
+     * 站方那一路的失败，是「等一等就好」还是「等不来」。
+     *
+     * 站方用 5xx 说「现在不行，过会儿再来」（实测约百分之一），用 4xx 说「这个查询我不接」——
+     * 后者是常驻的，等下去也不会变。形状变了（答了但读不懂）同样是常驻的：等不会把站方改回去。
+     *
+     * 所以：5xx 归「暂时」，4xx 和读不懂归「用不了」。网络错误（超时、断线）也是暂时的 ——
+     * 它跟 5xx 是同一种事。
+     */
+    private fun classifyServerFailure(e: Exception): ServerSearchProblem = when {
+        e is SearchShapeChangedException -> ServerSearchProblem.REJECTED
+        e is HttpStatusException && e.code in 400..499 -> ServerSearchProblem.REJECTED
+        e is org.json.JSONException -> ServerSearchProblem.REJECTED
+        else -> ServerSearchProblem.UNAVAILABLE
+    }
+    /**
+     * 站方搜索的十条补位行。
+     *
+     * 2026-10-22 实测：站方把 `/search/{关键词}` 改成了**纯前端渲染** —— HTML 里不再有
+     * `_ROUTER_DATA` 数据块（三个不同关键词返回的页面字节完全相同），数据改由
+     * `/api/search/result?query=…` 下发。**参数名是 `query`，不是 `keyword`**（用 keyword
+     * 回的是 400，用 query 才回 200）。
+     *
+     * 字段形状和当年 SSR 那份一模一样（`searchList[].video_data.*`），所以解析照旧。
+     * 这个接口还能翻页（请求参数 `page`，响应里是 `pageNum`/`totalPages`/`hasMore`），
+     * 但 App 的搜索主体是本机索引，站方这一路仍然只问第一页 —— 它只是补位。
+     *
+     * 这个接口只收 30 个字（[SITE_QUERY_LIMIT]），超了回 400。截断在 [search] 里做。
+     */
+    private fun publicSearch(keyword: String): List<Series> {
+        val body=text("$site/api/search/result?query=${Signer.encode(keyword)}")
+        val rows=JSONObject(body).optJSONArray("searchList") ?: throw SearchShapeChangedException()
+        return valid(rows.objects().map(::card))
+    }
+    /**
+     * 站方的两条路，合起来才是「新剧搜得到」的那一条路。
+     *
+     * 搜索结果那条路（`/api/search/result`）**只在用户打了完整剧名时才命中**：站方是模糊排序、
+     * 固定十条，同类的热门剧挤在前面。实测 2026-10-24：《我刚穿越，校花竟是重生女帝》（当天上架，
+     * 站方漫剧目录第 15 页）用完整剧名查是**第一行**，用「我刚穿越」或「校花竟是重生女帝」查，
+     * **翻完 22 页（220 行）也不出现**。新剧还没进本机索引时，这条路等于没有。
+     *
+     * 联想建议那条路（`/api/search/suggestion/`）是**按剧名**排的，半截词就够得着：同样这两个
+     * 半截词，它都把这部剧排在**第一行**（同一天实测）。新剧还没进本机索引时，这是唯一一条
+     * 能找到它的路 —— 而本机索引要等走查目录才收得到，站上新到目录里得再等一天。
+     *
+     * 只在索引没答上来的时候问它：索引答上来了，页面上已经有三十条本机索引的结果，
+     * 再多问一次只是多一个请求；索引答不上来，正是「站上新剧还没收录」的时候。
+     *
+     * 两条路各坏各的：只坏一条的时候，手上还有站方的行，说「站方不可用」就是把有的东西说成没有。
+     * 两条都空才算站方没答上来。
+     */
+    private fun siteRows(keyword: String, askSuggestion: Boolean): List<Series> {
+        val rows=mutableListOf<Series>()
+        var failure: Exception?=null
+        // 「答了」和「答回几行」是两件事：站方对一个没有的剧回一个空列表，那是答案，不是故障。
+        var answered=false
+        try { rows+=publicSearch(keyword); answered=true } catch(e: Exception) { failure=e }
+        if(askSuggestion) {
+            try { rows+=suggestionSearch(keyword); answered=true } catch(e: Exception) { if(failure==null) failure=e }
+        }
+        if(!answered && failure!=null) throw failure
+        return rows.distinctBy { it.id }
+    }
+    /**
+     * 站方的联想建议：比搜索结果更会找新剧的那一条路。
+     *
+     * 建议里的行分好几种，只一种能进列表：
+     * - `short_play_name` 且 video_data 齐全 —— 剧名、id、集数、封面都在，能直接用。
+     * - `title` 型的行，id 藏在 `keyword` 里，但那是**另一部剧**的 id，收进来就是个笃定的错答案。
+     * - `common_query` / `category` / `short_play_actor` 型的行根本没有剧。
+     *
+     * video_data 空着的 `short_play_name` 行同样不能要：实测「我刚穿越，校花竟是重生女帝第二季」
+     * （id 7699791879176473662）的详情页回 **404**，收进来就是一部点开就报错的剧 ——
+     * 站方给同一部剧的两个条目里，有一个是死的（见 docs/research/2026-10-23-hongguo-search-api.md）。
+     */
+    private fun suggestionSearch(keyword: String): List<Series> {
+        val body=text("$site/api/search/suggestion/?query=${Signer.encode(keyword)}")
+        val rows=JSONObject(body).optJSONArray("suggestionList") ?: throw SearchShapeChangedException()
+        return valid(rows.objects()
+            .filter { it.optString("word_type")=="short_play_name" }
+            .filter { (it.optJSONObject("video_data")?.optInt("episode_cnt",0) ?: 0) > 0 }
+            .map(::card))
+    }
+    fun detail(id: String): Detail {
+        require(id.matches(Regex("[0-9]{1,30}")))
+        val o=router("$site/detail?series_id=$id").optJSONObject("detail_page")?.optJSONObject("seriesDetail") ?: throw IOException("剧集详情暂不可用")
+        val raw=o.optJSONArray("vid_list") ?: throw IOException("分集暂不可用")
+        val episodes=(0 until raw.length()).map { raw.getString(it) }
+        if(episodes.isEmpty() || episodes.any { !it.matches(Regex("[0-9]{1,30}")) } || episodes.distinct().size!=episodes.size) throw IOException("分集数据异常")
+        return Detail(card(o).copy(id=id),episodes)
+    }
+    /**
+     * Find the other seasons of the same show.
+     *
+     * The App shows a 「系列剧」 tab, but no server-side endpoint exposes that relationship: every
+     * `/novel/series/` and `/novel/bookapi/series_*` path answers 404 (verified with a working
+     * control request against `video_model/v1/`), the public detail page carries no series field,
+     * and the reference APK's DEX has no `season`/`sub_series` string at all. Each season is simply
+     * its own `series_id` whose title carries a season marker.
+     *
+     * So this recovers the relationship the only way the remaining data allows: search the base
+     * title and keep whatever normalises onto the same base. That is deliberately conservative —
+     * 「变废为宝…」 and 「捡废为宝…」 are different shows that both have a 第二季, and fuzzy
+     * matching would wrongly merge them, so titles must be identical after the marker is removed.
+     *
+     * Returns the current series' siblings only; it is never empty-throwing, because a lone-season
+     * show is the normal case and must not surface an error.
+     */
+    fun seasons(series: Series): List<SeasonEntry> {
+        if(!series.id.matches(Regex("[0-9]{1,30}"))) return emptyList()
+        val base=seriesBaseTitle(series.title)
+        if(base.isBlank()) return emptyList()
+        val found=mutableListOf<SeasonEntry>()
+        val rows=runCatching { search(base,1).items }.getOrElse { return emptyList() }
+        for(row in rows) {
+            if(seriesBaseTitle(row.title)!=base) continue
+            val number=seasonNumber(row.title) ?: 1   // 无季号者即第一季
+            found+=SeasonEntry(row,number)
+        }
+        return found.distinctBy { it.series.id }.sortedBy { it.season }
+    }
+
+    /**
+     * Resolve a playable stream, asking the three doors in the order that answers today.
+     *
+     * The first door is the endpoint as it answers now: a registered identity and no signature -
+     * see [registeredStream]. It covers every episode of a show.
+     *
+     * The second is the signed endpoint `novel/player/video_model/v1/` with a top-level `video_id`
+     * string. It answered until 2026-10-27 and may answer again, so it stays - but a signed
+     * request that arrives with an identity made up on the spot is refused with HTTP 200 and a
+     * zero-byte body, which is why it is no longer the door that is asked first.
+     *
+     * The public player page is the last one: it needs no signature and survives the API going
+     * away again, but it hosts only the first three episodes at 360p.
+     */
+    /**
+     * The address of one episode.
+     *
+     * [window] is the run of episodes the episode sits in - the list the detail page holds. It
+     * is not used to choose a different episode: it is used so that one registration can serve
+     * the whole run, which is the only way the registration limit stops being the thing that
+     * breaks a long show.
+     */
+    fun stream(seriesId: String, id: String, maxQuality: Int = 1080, window: List<String> = emptyList()): StreamInfo {
+        require(seriesId.matches(Regex("[0-9]{1,30}")) && id.matches(Regex("[0-9]{1,30}")))
+        return try { streamDoors(seriesId,id,maxQuality,window) }
+        catch(e: Exception) {
+            // The caller is the person waiting in front of the set, so a failure of the network
+            // is named as what it is: the address could not be obtained, and the next thing that
+            // helps is another attempt at the address - not another quality.
+            //
+            // A refusal keeps its own wording: it is a different thing, and it says more about
+            // the site than a generic failure would.
+            when(e) {
+                is AddressLookupException,is SampleClipException,is RegistrationUnavailableException -> throw e
+                is PublicPageHasNoEpisodeException -> throw e
+                else -> {
+                    if(isCancellation(e)) throw e
+                    if(isNetworkFailure(e)) throw AddressLookupException(isTimeoutFailure(e),e)
+                    throw e
+                }
+            }
+        }
+    }
+    /**
+     * Asks the doors in the order that answers today.
+     *
+     * The doors themselves are described on [stream]; this is where the order is decided.
+     */
+    private fun streamDoors(seriesId: String, id: String, maxQuality: Int, window: List<String>): StreamInfo {
+        // App 自己用的那条 GET 路先问：2026-11-10 它是唯一还在答的取址接口。
+        try { return tabStream(id,maxQuality) }
+        catch(tab: Exception) {
+            // 它空答时站方没说原因，往后退回老门；老门也空答才轮到公开页（只有 10 秒试看）。
+            if(fallbackCannotHelp(tab)) throw tab
+            try { return streamDoorsLegacy(seriesId,id,maxQuality,window) }
+            catch(legacy: Exception) { legacy.addSuppressed(tab); throw legacy }
+        }
+    }
+    /**
+     * 老的三道门：注册身份 → 签名 POST → 公开页。
+     *
+     * 2026-11-10 起站方把 POST /novel/player/multi_video_model/v1/ 这一族关掉了（带签名的
+     * 请求一律 HTTP 200 + 0 字节），所以这一串只剩公开页还有用 —— 但公开页只有 10 秒试看。
+     */
+    private fun streamDoorsLegacy(seriesId: String, id: String, maxQuality: Int, window: List<String>): StreamInfo {
+        try { return registeredStream(id,maxQuality,window) }
+        catch(registered: Exception) {
+            // The signed door sits on the same host as the registered one, so when the first
+            // attempt died of the network the second one dies of the same network - and the
+            // wait before the person hears anything grows with it. The public page is another
+            // host, but it only has the ten-second sample, so it is not worth a detour either.
+            if(fallbackCannotHelp(registered)) throw registered
+            try { return signedStream(id,maxQuality) }
+            catch(signed: Exception) {
+                if(fallbackCannotHelp(signed)) {
+                    signed.addSuppressed(registered); throw signed
+                }
+                try { return webStream(seriesId,id,maxQuality) }
+                catch(web: Exception) {
+                    // The public page hosts only the first three episodes, so its 404 means 「这一集
+                    // 不在公开页上」 - not 「这部剧只有 3 集」. Saying the latter about a whole show
+                    // because one attempt was refused is a permanent-sounding verdict drawn from a
+                    // page that never had the episode in it, and it is exactly what the signed path
+                    // falling back there used to produce.
+                    if(signed is EmptySignedAnswerException && web is PublicPageHasNoEpisodeException) {
+                        web.addSuppressed(signed)
+                        throw EmptySignedAnswerException()
+                    }
+                    web.addSuppressed(signed); throw web
+                }
+            }
+        }
+    }
+    /**
+     * 一集播放地址，走官方 App 现在用的那条 GET 路。
+     *
+     * 2026-11-10 实测：站方把 POST /novel/player/multi_video_model/v1/ 这一族关掉了 —— 带签名的
+     * 请求一律回 HTTP 200 + 0 字节（软拦截，看不到任何错误码）。换成 App 现在这条
+     * GET /reading/bookapi/video_tab/multi_video_model/v1/ 之后，同一集一次就取回完整模型
+     * （约 23 KB，code=0，video_list 内联五档）。
+     *
+     * 这条路有三个要点，缺一个就又是 0 字节：
+     *
+     * 1. 参数全在 query 上，body 是空的：video_id / video_id_type / device_level /
+     *    need_all_video_definition / need_mp4_align / use_os_player / video_platform /
+     *    source / from_video_id。少一个，服务端回 100103 PARAM_INVALID。
+     * 2. 身份是一次性的：同一个注册身份第二次取流就回 0 字节，所以每取一集都要新注册一次。
+     * 3. 签名照旧六个头，签名把 query 和 body 一起算；这里没有 body，body 的 md5 记作
+     *    16 个零字节（与站方 App 一致）。
+     *
+     * 这条路本来就是 App 自己用的那条（官方 APK 里 GetVideoModelRequest 的参数名就是
+     * snake_case），所以它比网页版那条 POST 稳。
+     */
+    private fun tabStream(id: String, maxQuality: Int): StreamInfo {
+        cachedAddress(id)?.let { return it }
+        val model=tabVideoModel(id) ?: throw EmptySignedAnswerException()
+        val stream=episodeStream(model,maxQuality)
+        rememberAddress(id,stream)
+        return stream
+    }
+    /**
+     * 播放模型：一次全新身份、一次请求；空答就换一个新身份再来一次。
+     *
+     * 身份是站方发的一次性凭证（见上面第 2 点），所以每次取址都要重新注册；注册本身
+     * 有配额，被拒时 [RegistrationUnavailableException] 直接往外抛，不该被当成空答。
+     */
+    private fun tabVideoModel(id: String): JSONObject? {
+        var failure: Exception?=null
+        var empty=false
+        for(attempt in 0..1) {
+            val identity=try { takePlaybackIdentity() }
+            catch(e: Exception) { failure=e; continue }
+            val model=try { tabVideoModelOnce(id,identity) }
+            catch(e: Exception) { failure=e; continue }
+            if(model!=null) return model
+            empty=true
+        }
+        // 空答是站方的软拦截（HTTP 200 + 0 字节），不是这一集没有片源。
+        if(!empty && failure!=null) throw failure
+        throw EmptySignedAnswerException().also { e -> failure?.let { e.addSuppressed(it) } }
+    }
+    /**
+     * 一次 GET 请求的播放模型；空答、结构不对、业务码非 0 都算没有。
+     */
+    private fun tabVideoModelOnce(id: String, identity: PlaybackIdentity): JSONObject? {
+        // 签名绑的是「最终 query 原文 + 实际发送的 body」，所以 query 只拼一次，
+        // 两个域名用的是同一份 query 与同一份签名。
+        val ts=clock()/1000
+        val query=tabQuery(id,identity,ts,clock())
+        for(host in PLAYBACK_HOSTS) {
+            val text=try { tabVideoModelText(host,query,ts) } catch(e: Exception) { "" }
+            if(text.isBlank()) continue
+            val root=runCatching { JSONObject(text) }.getOrNull() ?: continue
+            val code=if(root.has("code")) root.optInt("code",-1) else root.optInt("Code",-1)
+            if(code!=0) continue
+            val data=root.optJSONObject("data") ?: continue
+            // 模型挂在 video_model_data 下面这一集的位置上；老形状直接挂在 data 下面。
+            val rows=data.optJSONObject("video_model_data") ?: data
+            val row=rows.optJSONObject(id)
+                ?: rows.keys().asSequence().mapNotNull { rows.optJSONObject(it) }.firstOrNull()
+                ?: continue
+            val raw=row.opt("video_model") ?: continue
+            val model=when(raw) {
+                is JSONObject -> raw
+                is String -> runCatching { JSONObject(raw) }.getOrNull()
+                else -> null
+            } ?: continue
+            // 没有片源、也没有第二个地址，就是这一集没有可播的东西。
+            if((model.optJSONArray("video_list")?.length() ?: 0)==0 && !model.has("fallback_api")) continue
+            return model
+        }
+        return null
+    }
+    /**
+     * 取址这条 GET 的 query，参数顺序照抄站方 App。
+     *
+     * 顺序不是排版问题：签名把 query 的字节原样算进去，顺序变了就是另一份签名。
+     * App 的写法是「设备字段 → 注册身份（device_id / iid / cdid）→ 业务参数 → ts / _rticket」。
+     *
+     * - 设备字段用 [VIDEO_TAB_DEVICE_PARAMS]（73932 / 7.3.9.32），跟注册 body 对得上；
+     * - 身份是站方发的一次性凭证，三个字段都得带上（cdid 就是注册 body 里那个）；
+     * - 业务参数全在 query 上，body 是空的；少一个服务端回 100103 PARAM_INVALID；
+     * - ts 是秒，_rticket 是毫秒。
+     */
+    private fun tabQuery(id: String, identity: PlaybackIdentity, ts: Long, ticket: Long): String {
+        val values=LinkedHashMap<String,String>(VIDEO_TAB_DEVICE_PARAMS)
+        values["device_id"]=identity.deviceId
+        values["iid"]=identity.iid
+        values["cdid"]=identity.cdid
+        // App 这条 GET 把参数写在 query 上，body 是空的。
+        values["video_id"]=id
+        values["video_id_type"]="0"
+        values["device_level"]=PLAYBACK_DEVICE_LEVEL.toString()
+        values["need_all_video_definition"]="1"
+        values["need_mp4_align"]="0"
+        values["use_os_player"]="0"
+        values["video_platform"]="1024"
+        values["source"]="0"
+        values["from_video_id"]=""
+        values["ts"]=ts.toString()
+        values["_rticket"]=ticket.toString()
+        return values.entries.joinToString("&") { (k,v) -> playbackEncode(k)+"="+playbackEncode(v) }
+    }
+    /**
+     * 一次签名的 GET：query 与真签名头一起发给站方。
+     *
+     * 2026-11-11 起这里换掉了占位签名（x-argus / x-ladon 只是时间戳的 base64）：
+     * 站方收下占位签名，一律回 HTTP 200 + 0 字节，既不报错也不说是限流。
+     * 现在用的是真的 551 Argus / Ladon，见 [PlayerSigner]。
+     *
+     * 头只带这条 GET 该带的：无正文，所以没有 Content-Type、没有 gzip、没有 x-ss-stub；
+     * 带 x-tt-request-tag，passport-sdk-version 用 tab 这一档的 50561。
+     */
+    private fun tabVideoModelText(host: String, query: String, ts: Long): String {
+        val signature=PlayerSigner.headers(query,null,ts)
+        val request=Request.Builder().url("https://$host"+PLAYBACK_TAB_PATH+"?"+query)
+        request.header("User-Agent",PLAYBACK_TAB_UA)
+        request.header("Accept","application/json; charset=utf-8,application/x-protobuf")
+        request.header("sdk-version","2")
+        request.header("x-xs-from-web","0")
+        request.header("passport-sdk-version","50561")
+        request.header("x-ss-dp","8662")
+        for((k,v) in signature) request.header(k,v)
+        request.header("x-tt-dt","")
+        request.header("x-tt-store-region","cn")
+        request.header("x-tt-store-region-src","did")
+        request.header("x-tt-request-tag","t=0;n=0")
+        request.get()
+        return addressLookup { client -> RequestScope.execute(client.newCall(request.build())) { response ->
+            if(!response.isSuccessful) throw HttpStatusException(response.code)
+            response.body?.string() ?: ""
+        } }
+    }
+    /**
+     * The playback endpoint as it answers today.
+     *
+     * 2026-10-27: the endpoint stopped accepting a signed request - one that carries the
+     * signature headers and an identity that was made up on the spot is answered with HTTP 200
+     * and a zero-byte body - and it started accepting an unsigned request that carries the
+     * identity the platform registered.
+     *
+     * 2026-11-02: that was not the end of it. The endpoint asks for the signature again, and
+     * the request that carries the registered identity but no signature headers is answered
+     * the same silent way - HTTP 200, zero bytes. The catalogue kept working, so the only
+     * symptom was that every episode played ten seconds of sample and then stopped. The
+     * request is signed the way [Signer] signs every other request: the query carries the
+     * registered identity and the timestamp, and the six signature headers ride along.
+     *
+     * The answer holds one entry per episode that was asked for, and the model it carries usually
+     * has the renditions inline; only some answers point at a second address instead.
+     */
+    private fun registeredStream(id: String, maxQuality: Int, window: List<String>): StreamInfo {
+        // An address that was already fetched is an address that costs nothing.
+        cachedAddress(id)?.let { return it }
+        // One signed request carries a whole window of episodes, and that is the whole point:
+        // the registration - the thing the site limits - is spent once for the window instead
+        // of once per episode.
+        val ids=windowFor(id,window)
+        val batch=batchAddresses(ids,maxQuality)
+        batch.forEach { (key,value) -> rememberAddress(key,value) }
+        batch[id]?.let { return it }
+        // The answer came back and this episode was not in it: the model it carries holds only
+        // renditions the television cannot decode, and the site answers one episode asked on
+        // its own with a different model. So it is asked on its own.
+        val single=batchAddresses(listOf(id),maxQuality)
+        single.forEach { (key,value) -> rememberAddress(key,value) }
+        return single[id] ?: throw AddressLookupException(false,IOException("没有取到这一集的播放地址"))
+    }
+    /**
+     * The addresses of several episodes, asked in one signed request.
+     *
+     * The endpoint takes a list of ids: measured 2026-11-05, fifteen of them come back with the
+     * whole model for each, and twenty are refused with 「video_id list len over limit:20」.
+     */
+    private fun batchAddresses(ids: List<String>, maxQuality: Int): Map<String, StreamInfo> {
+        val list=ids.joinToString(",") { "\"$it\"" }
+        val body="""{"biz_param":{"detail_page_version":0,"device_level":$PLAYBACK_DEVICE_LEVEL,"disable_digg_stat":false,"need_all_video_definition":true,"need_mp4_align":false,"use_os_player":false,"use_server_dns":false,"video_platform":1024},"mixed_video_id_map":{"1004":[$list]}}""".toByteArray()
+        val answer=JSONObject(signedPlaybackWithFreshIdentity(body))
+        val code=if(answer.has("code")) answer.optInt("code",-1) else answer.optInt("Code",-1)
+        if(code!=0) throw IOException("播放接口暂不可用")
+        val data=answer.optJSONObject("data") ?: throw IOException("播放信息为空")
+        val out=LinkedHashMap<String,StreamInfo>()
+        for(id in ids) {
+            // The model hangs under the episode that was asked for; the older shape put it
+            // straight under `data`.
+            val raw=data.optJSONObject(id)?.opt("video_model") ?: data.opt("video_model")
+            val model=when(raw) {
+                is JSONObject -> raw
+                is String -> runCatching { JSONObject(raw) }.getOrNull()
+                else -> null
+            }
+            // One episode that cannot be decoded does not sink the other fourteen.
+            if(model==null) continue
+            val stream=runCatching { episodeStream(model,maxQuality) }.getOrNull() ?: continue
+            out[id]=stream
+        }
+        return out
+    }
+    /**
+     * The address of one episode, out of the model the answer carries.
+     *
+     * A model whose renditions are all ByteVC2 holds nothing the television can decode - the
+     * site hands those out when a whole window is asked for at once, while the same episode
+     * asked on its own comes back with ByteVC1. The second address the model points at is the
+     * way out, so it is asked for whenever the model itself has nothing to play.
+     */
+    private fun episodeStream(model: JSONObject, maxQuality: Int): StreamInfo {
+        if(playableRenditions(model).isNotEmpty()) return pickStream(model,maxQuality)
+        val fallback=fallbackApi(model)
+        if(!fallback.startsWith("https://")) throw IOException("没有电视可播放的清晰度，请稍后再试或选择其他剧集")
+        val info=fallbackInfo(fallback)
+        if(playableRenditions(info).isNotEmpty()) return pickStream(info,maxQuality)
+        // 全档都是 ByteVC2：这一集的内联模型和它的备用地址都只给了电视解不了的编码。
+        // 官方播放器这时会带着 codec_type 再要一次备用地址。2026-11-10 实测（漫剧
+        // 《重生后我给emo修士当狗》第一集 7703473857562151961）：codec_type=3 才给 ByteVC1
+        // （HEVC，电视能放），codec_type=0/1/2/4/5 以及不带这个参数都只给 ByteVC2。
+        val compatible=fallbackInfo(fallbackWithCodec(fallback,"3"))
+        return pickStream(compatible,maxQuality)
+    }
+    /**
+     * 备用地址（fallback_api）回来的播放信息。
+     */
+    private fun fallbackInfo(fallback: String): JSONObject {
+        val outer=JSONObject(text(fallback,client=addressHttp))
+        return outer.optJSONObject("video_info")?.optJSONObject("data") ?: throw IOException("没有播放资源")
+    }
+    /**
+     * 给备用地址换一个 codec_type。
+     *
+     * 备用地址自己是带签名的（auth_policy 在 query 里），所以只能改 query，不能重签；
+     * 这里只动 codec_type 这一个参数，其余原样保留。
+     */
+    private fun fallbackWithCodec(fallback: String, codec: String): String {
+        val re=Regex("([?&])codec_type=[^&]*")
+        if(re.containsMatchIn(fallback)) return fallback.replace(re,"\$1codec_type=" + codec)
+        return fallback + (if(fallback.contains('&')) "&" else "?") + "codec_type=" + codec
+    }
+    /**
+     * The episodes one request carries, with the wanted one among them.
+     *
+     * The window starts at the wanted episode, so the ones after it - the ones the person is
+     * about to watch - are in the same answer.
+     */
+    private fun windowFor(id: String, window: List<String>): List<String> {
+        if(window.isEmpty()) return listOf(id)
+        val index=window.indexOf(id)
+        if(index<0) return listOf(id)
+        val last=(window.size-PLAYBACK_BATCH_SIZE).coerceAtLeast(0)
+        val from=index.coerceAtMost(last)
+        return window.subList(from,minOf(window.size,from+PLAYBACK_BATCH_SIZE)).toList()
+    }
+    /** The address that was already fetched for an episode, if it is still worth having. */
+    private fun cachedAddress(id: String): StreamInfo? {
+        val entry=addressCache[id] ?: return null
+        if(clock()-entry.at>ADDRESS_CACHE_TTL_MS) { addressCache.remove(id); return null }
+        return entry.stream
+    }
+    /** Keeps an address, so that the episodes around it do not have to be asked for again. */
+    private fun rememberAddress(id: String, stream: StreamInfo) {
+        if(addressCache.size>=ADDRESS_CACHE_MAX) addressCache.remove(addressCache.keys.first())
+        addressCache[id]=CachedAddress(stream,clock())
+    }
+    /**
+     * The playback answer, asked with an identity that has not been used yet.
+     *
+     * A registered identity is good for exactly one address lookup. The second lookup with the
+     * same identity comes back with an empty body - the endpoint saying that this identity has
+     * been used - and it keeps saying so. So the identity is spent as it is handed out, and a
+     * lookup that comes back empty registers a new one and asks again.
+     *
+     * Measured 2026-11-05: ten lookups with one identity answered once and were empty nine
+     * times; the eleventh, with a freshly registered identity, answered at once.
+     */
+    private fun signedPlaybackWithFreshIdentity(body: ByteArray): String {
+        var refusal: Exception?=null
+        for(attempt in 0..1) {
+            val identity=try { takePlaybackIdentity() }
+            catch(e: Exception) { refusal=e; continue }
+            val text=try { signedPlaybackAnswer(identity,body) }
+            catch(e: Exception) { refusal=e; "" }
+            if(text.isNotBlank()) return text
+        }
+        throw refusal ?: EmptySignedAnswerException()
+    }
+    /**
+     * The registered identity, spent as it is handed out.
+     *
+     * The endpoint lets one identity ask for one address, so the identity is dropped here
+     * rather than kept for the next episode.
+     */
+    @Synchronized private fun takePlaybackIdentity(): PlaybackIdentity {
+        val identity=playbackIdentity()
+        registeredIdentity=null
+        return identity
+    }
+    /**
+     * The playback answer, with the second host as the way out.
+     *
+     * The main host answers with an empty body for this client, and the same signed request
+     * on the second host carries the whole model. Both are signed separately: the signature
+     * covers the query and the timestamp, so a request signed for one host is not a request
+     * signed for the other.
+     */
+    private fun signedPlaybackAnswer(identity: PlaybackIdentity, body: ByteArray): String {
+        val device=LinkedHashMap<String,String>(PLAYBACK_DEVICE_PARAMS)
+        device["device_id"]=identity.deviceId
+        device["iid"]=identity.iid
+        var refusal: Exception?=null
+        for(host in PLAYBACK_HOSTS) {
+            val text=try { signedPlaybackText(host,device,body) }
+            catch(e: Exception) { refusal=e; "" }
+            if(text.isNotBlank()) return text
+        }
+        throw refusal ?: EmptySignedAnswerException()
+    }
+    /**
+     * One signed playback request.
+     *
+     * The signature is made here rather than in [Signer.sign] alone because the endpoint wants
+     * the registered identity in the query and inside the signature at the same time.
+     */
+    private fun signedPlaybackText(host: String, device: Map<String,String>, body: ByteArray): String {
+        val signed=signer.sign("https://$host/novel/player/multi_video_model/v1/",device,body)
+        val request=Request.Builder().url(signed.url)
+        for((k,v) in signed.headers) request.header(k,v)
+        request.post(body.toRequestBody("application/json; charset=UTF-8".toMediaType()))
+        return addressLookup { client -> RequestScope.execute(client.newCall(request.build())) { response ->
+            if(!response.isSuccessful) throw HttpStatusException(response.code)
+            response.body?.string() ?: ""
+        } }
+    }
+    /**
+     * The renditions a model carries, in either of the two shapes they arrive in.
+     *
+     * The array shape says what each rendition is inside the entry; the object shape keys the
+     * entries by the definition, and then the key is the only place the size is written down.
+     */
+    private fun renditions(info: JSONObject): List<Pair<String,JSONObject>> {
+        val out=mutableListOf<Pair<String,JSONObject>>()
+        info.optJSONArray("video_list")?.let { array -> for(i in 0 until array.length()) array.optJSONObject(i)?.let { out.add("" to it) } }
+        info.optJSONObject("video_list")?.let { map -> for(key in map.keys()) map.optJSONObject(key)?.let { out.add(key to it) } }
+        return out
+    }
+    /**
+     * The renditions a television can actually decode.
+     *
+     * ByteVC2 renditions declare themselves as `bvc2` and ship no avcC/hvcC record at all, so
+     * Android's extractor finds an audio track and no video track. Only ByteVC1 (HEVC) plays.
+     */
+    private fun playableRenditions(info: JSONObject): List<Pair<String,JSONObject>> = renditions(info).filter { (_,item) ->
+        val meta=item.optJSONObject("video_meta")
+        val codec=item.str("codec_type").ifEmpty { meta?.str("codec_type").orEmpty() }.lowercase()
+        if(codec in setOf("bytevc2","bvc2")) return@filter false
+        item.str("main_url").ifEmpty { item.str("backup_url") }.isNotEmpty()
+    }
+    /** The second address a model points at, in the shape it arrives in. */
+    private fun fallbackApi(model: JSONObject): String {
+        val raw=model.opt("fallback_api")
+        return when(raw) {
+            is JSONObject -> raw.str("fallback_api")
+            is JSONArray -> raw.optString(0)
+            is String -> runCatching { JSONObject(raw).str("fallback_api") }.getOrDefault(raw)
+            else -> ""
+        }
+    }
+    /**
+     * The playable rendition out of a video model.
+     *
+     * The model describes each rendition twice over: the codec and the size sit in `video_meta`
+     * while the address sits at the top of the entry, and the content key sits in `encrypt_info`.
+     * A model that arrives from the older endpoint has all of it at the top level instead, so
+     * every field is read from both places.
+     */
+    private fun pickStream(info: JSONObject, maxQuality: Int): StreamInfo {
+        val seed=info.str("key_seed")
+        val rows=playableRenditions(info).mapNotNull { (key,item) ->
+            val meta=item.optJSONObject("video_meta")
+            val url=item.str("main_url").ifEmpty { item.str("backup_url") }
+            if(url.isEmpty()) return@mapNotNull null
+            val definition=item.str("definition").ifEmpty { meta?.str("definition").orEmpty() }
+            val height=qualityNumber(definition.ifEmpty {
+                item.str("quality_desc").ifEmpty { item.str("height").ifEmpty {
+                    item.str("vheight").ifEmpty { meta?.str("vheight").orEmpty() }.ifEmpty { key } } } })
+            Rendition(url,height,item)
+        }.sortedByDescending { it.height }
+        val selected=rows.firstOrNull { it.height<=maxQuality } ?: rows.lastOrNull()
+            ?: throw IOException("没有电视可播放的清晰度，请稍后再试或选择其他剧集")
+        var url=cleanUrl(selected.url)
+        if(seed.isNotEmpty()) url=MediaCrypto.decryptUrl(url,decode64(seed))
+        if(!url.startsWith("https://") && !url.startsWith("http://")) throw IOException("播放地址无效")
+        val spade=selected.item.str("spade_a").ifEmpty { selected.item.optJSONObject("encrypt_info")?.str("spade_a").orEmpty() }
+        val key=spade.takeIf { it.isNotEmpty() }?.let { runCatching { MediaCrypto.deriveKey(it) }.getOrNull() }
+        val quality=if(selected.height>0) "${selected.height}P"+(if(selected.height>maxQuality) "（兼容资源）" else "") else "自动"
+        return StreamInfo(url,key,quality)
+    }
+    /** One rendition of a model: where it is, how big it is, and what the entry said about it. */
+    private class Rendition(val url: String, val height: Int, val item: JSONObject)
+    /** One cached address: the stream, and the moment it was fetched. */
+    private class CachedAddress(val stream: StreamInfo, val at: Long)
+    private fun signedStream(id: String, maxQuality: Int): StreamInfo {
+        val payload="""{"biz_param":{"detail_page_version":0,"device_level":$PLAYBACK_DEVICE_LEVEL,"disable_digg_stat":false,"need_all_video_definition":true,"need_mp4_align":false,"use_os_player":false,"use_server_dns":false,"video_platform":1024},"video_id":"$id"}""".toByteArray()
+        // A fresh identity per signed attempt: the previously hardcoded pair is shared by every
+        // client built from the drpys sources and is now silently blocked (HTTP 200, empty body),
+        // and replaying one generated pair turns later answers back into empty bodies as well -
+        // which is why [VendorConstants.newDevice] is called per attempt and not per episode.
+        //
+        // The attempts run at the same time rather than one after the other. The endpoint
+        // refuses an attempt with an empty body about seven times in eight, and that rate does
+        // not move with the request rate, the identity, the connection or the server address -
+        // so asking again is the only thing that helps, and asking a dozen times at once costs
+        // one round trip where asking six times in series cost six. See [SignedRetryPolicy].
+        //
+        // The loop is bounded twice: by the number of waves and by a wall-clock budget. The
+        // budget matters because each attempt carries the address lookup's own ten-second call
+        // timeout, so waves against a server that hangs would cost a minute of silence - far
+        // longer than the person watching the screen is willing to wait for an episode.
+        val started=System.currentTimeMillis()
+        var refusal: Exception?=null
+        for(wave in 0 until SignedRetryPolicy.WAVES) {
+            if(!SignedRetryPolicy.waveAllowed(wave,System.currentTimeMillis()-started)) break
+            val answers=signedWave(payload)
+            val usable=answers.filter { it.body.isNotBlank() }
+            if(usable.isEmpty()) {
+                // Nothing came back with a body. Whether the fallback is worth making depends on
+                // which of the two that is: the endpoint answering with an empty body is a
+                // refusal (ask the public page), while every attempt dying of the network is a
+                // dead network (the public page is the same dead network).
+                refusal=if(answers.any { it.failure==null }) EmptySignedAnswerException()
+                    else answers.firstNotNullOfOrNull { it.failure } ?: EmptySignedAnswerException()
+                continue
+            }
+            for(answer in usable) {
+                // An empty body is a refusal of that attempt, not a verdict on the episode - see
+                // [EmptySignedAnswerException]. A body that is not JSON is the same refusal
+                // wearing a different hat, and the next answer in the wave may be a good one.
+                try { return parseSignedStream(answer.body,maxQuality) }
+                catch(e: JSONException) { refusal=e }
+            }
+        }
+        throw refusal ?: EmptySignedAnswerException()
+    }
+    /**
+     * One answer from the signed endpoint.
+     *
+     * A body that came back is kept even when it cannot be parsed: the next answer in the wave
+     * may be a good one. A failure is kept as well, so that a wave that died of the network
+     * says so instead of looking like a refusal.
+     */
+    private class SignedAnswer(val body: String, val failure: Exception?)
+    /**
+     * Asks the signed endpoint once per identity, all at the same time.
+     *
+     * The scope that owns the lookup travels with the requests: [RequestScope] is a thread
+     * local, so a request that ran on another thread without it could no longer be cancelled
+     * when the person walks away from the episode.
+     */
+    private fun signedWave(payload: ByteArray): List<SignedAnswer> {
+        val owner=RequestScope.owner()
+        val ask={
+            val signed=signer.sign(VIDEO_MODEL_API,VendorConstants.newDevice(),payload)
+            val body=text(signed.url,signed,addressHttp)
+            SignedAnswer(body,null)
+        }
+        val pool=http.dispatcher.executorService
+        val tasks=mutableListOf<java.util.concurrent.Future<SignedAnswer>>()
+        for(index in 0 until SignedRetryPolicy.WAVE_SIZE) {
+            val task=try {
+                pool.submit(java.util.concurrent.Callable {
+                    try { if(owner==null) ask() else owner.run { ask() } }
+                    catch(e: Exception) { SignedAnswer("",e) }
+                })
+            } catch(rejected: java.util.concurrent.RejectedExecutionException) {
+                // The transport is shutting down. One serial attempt is better than none.
+                return listOf(try { ask() } catch(e: Exception) { SignedAnswer("",e) })
+            }
+            tasks+=task
+        }
+        return tasks.map { task ->
+            try { task.get() }
+            catch(e: Exception) { SignedAnswer("",e) }
+        }
+    }
+    /**
+     * Reads the playable rendition out of a signed answer.
+     *
+     * Split out of [signedStream] so that the retry loop only has to decide whether the answer
+     * arrived at all; everything that decides *what* to play stays in one place.
+     */
+    private fun parseSignedStream(body: String, maxQuality: Int): StreamInfo {
+        val data=JSONObject(body)
+        val code=if(data.has("code")) data.optInt("code",-1) else data.optInt("Code",-1)
+        if(code!=0) throw IOException("播放接口暂不可用")
+        val map=data.optJSONObject("data") ?: throw IOException("播放信息为空")
+        // video_model arrives as a JSON-encoded string, not a nested object.
+        val model=map.optJSONObject("video_model") ?: runCatching { JSONObject(map.str("video_model")) }.getOrNull() ?: throw IOException("播放信息为空")
+        val raw=model.opt("fallback_api")
+        val fallback=when(raw) { is JSONObject -> raw.str("fallback_api"); is JSONArray -> raw.optString(0); else -> runCatching { JSONObject(raw.toString()).str("fallback_api") }.getOrDefault(raw.toString()) }
+        if(!fallback.startsWith("https://")) throw IOException("播放地址格式异常")
+        val info=JSONObject(text(fallback,client=addressHttp)).optJSONObject("video_info")?.optJSONObject("data") ?: throw IOException("没有播放资源")
+        val videoList=info.optJSONObject("video_list") ?: throw IOException("没有可用清晰度")
+        // ByteVC2 renditions declare themselves as `bvc2` and ship no avcC/hvcC record at all, so
+        // Android's extractor finds an audio track and no video track. Only ByteVC1 (HEVC) plays.
+        val rows=videoList.keys().asSequence().mapNotNull { k -> videoList.optJSONObject(k)?.let { k to it } }.filter {
+            it.second.str("main_url").isNotEmpty() && it.second.str("codec_type").lowercase() !in setOf("bytevc2","bvc2")
+        }.map { (k,o) -> Triple(qualityNumber(o.str("definition").ifEmpty { o.str("quality_desc").ifEmpty { o.str("height").ifEmpty { o.str("vheight").ifEmpty { o.str("quality").ifEmpty { k } } } } }),k,o) }.sortedByDescending { it.first }.toList()
+        val selected=rows.firstOrNull { it.first<=maxQuality } ?: rows.lastOrNull() ?: throw IOException("没有电视可播放的清晰度，请稍后再试或选择其他剧集")
+        val item=selected.third; var url=cleanUrl(item.str("main_url")); val seed=info.str("key_seed")
+        if(seed.isNotEmpty()) url=MediaCrypto.decryptUrl(url,decode64(seed))
+        if(!url.startsWith("https://") && !url.startsWith("http://")) throw IOException("播放地址无效")
+        val key=item.str("spade_a").takeIf { it.isNotEmpty() }?.let(MediaCrypto::deriveKey)
+        val quality=if(selected.first>0) "${selected.first}P"+(if(selected.first>maxQuality) "（兼容资源）" else "") else "自动"
+        return StreamInfo(url,key,quality)
+    }
+    private fun webStream(seriesId: String, id: String, maxQuality: Int): StreamInfo {
+        val html=try { addressLookup { client -> text("$site/player/$seriesId/$id",client=client) } }
+        catch(e: HttpStatusException) { if(e.code==404) throw PublicPageHasNoEpisodeException(); throw e }
+        val raw=Regex("\"contentUrl\"\\s*:\\s*\"([^\"]+)\"").find(html)?.groupValues?.get(1)
+            ?: Regex("\"main_url\"\\s*:\\s*\"([^\"]+)\"").find(html)?.groupValues?.get(1)
+            ?: throw IOException("播放地址暂不可用")
+        // A Range parameter baked into the page would truncate playback to that slice.
+        val url=cleanUrl(raw).replace(Regex("([?&])Range=[^&]*",RegexOption.IGNORE_CASE),"${'$'}1").trimEnd('?','&')
+        if(!url.startsWith("https://") && !url.startsWith("http://")) throw IOException("播放地址格式异常")
+        val height=Regex("(\\d{3,4})p").find(url)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+        val quality=if(height>0) "${height}P"+(if(height>maxQuality) "（兼容资源）" else "") else "自动"
+        return StreamInfo(url,null,quality)
+    }
+    companion object {
+        /** The only signed player endpoint that still answers; see [stream]. */
+        const val VIDEO_MODEL_API = "https://api5-normal-sinfonlineb.fqnovel.com/novel/player/video_model/v1/"
+        /**
+         * The player endpoint as it answers today.
+         *
+         * It is the same endpoint the signed path used, and the same host, but the request is
+         * not the same: this one carries a registered identity and no signature at all.
+         */
+        const val PLAYBACK_API = "https://api5-normal-sinfonlineb.fqnovel.com/novel/player/multi_video_model/v1/"
+        /**
+         * The hosts the playback endpoint is asked, in order.
+         *
+         * The first one answers with an empty body for this client; the second one carries the
+         * same answer. Both are asked on every episode, because the first one is the one that
+         * works when the endpoint stops singling this client out.
+         */
+        val PLAYBACK_HOSTS = listOf("api5-normal-sinfonlineb.fqnovel.com","api5-normal-hl.fqnovel.com")
+        /**
+         * 官方 App 现在用的取址路径（GET，参数全在 query 上）。
+         *
+         * 2026-11-10 实测：POST /novel/player/multi_video_model/v1/ 这一族已被站方关掉
+         * （带签名的请求一律 HTTP 200 + 0 字节），换成这条 GET 就一次取回完整模型。
+         */
+        const val PLAYBACK_TAB_PATH = "/reading/bookapi/video_tab/multi_video_model/v1/"
+        /**
+         * The user agent the playback request wears.
+         *
+         * It is not the one the signed requests use: the endpoint tells the two apart, so a
+         * playback request that arrives in the signed request's clothes is refused with an empty
+         * body.
+         */
+        const val PLAYBACK_UA = "com.phoenix.read/71532 (Linux; U; Android 9; SM-N9860; Build/PQ3A.190705.10241111;tt-ok/3.12.13.20)"
+        /**
+         * How long a failed device registration is not retried.
+         *
+         * The failure is not remembered as a failure - only the attempt is not repeated - so
+         * that a person turning the set on does not pay for a registration attempt on every
+         * episode, while a single minute later the registration is tried again.
+         *
+         * The window used to be a minute. That was long enough for every attempt inside it to
+         * be answered with the public page's ten-second sample: the box played ten seconds of
+         * 360p, said "failed", and did it again - which is what "播放总是重试" looked like from
+         * the sofa. Five seconds is long enough to keep a dead network from being asked on
+         * every episode and short enough that the next attempt is a real one.
+         */
+        const val PLAYBACK_REGISTRATION_RETRY_MS = 5_000L
+        /**
+         * How long the site is left alone after it refused to hand out a device.
+         *
+         * The refusal is not a network hiccup and it does not go away by asking again: the
+         * requests pile up on the same limit, and the window gets longer rather than shorter.
+         * Measured 2026-11-05: eight registrations in a row all came back with `device_id` and
+         * `install_id` zero, and a registration a while later was answered at once.
+         */
+        const val PLAYBACK_REGISTRATION_REFUSED_BACKOFF_MS = 10*60_000L
+        /** What the refusal says, in words the person in front of the set can act on. */
+        const val REGISTRATION_REFUSED_REASON = "站方暂时没有给这台设备发号，稍后会自动重试"
+        /**
+         * How many episodes one signed request may carry.
+         *
+         * Measured 2026-11-05: fifteen come back with the whole model for each of them, and
+         * twenty are refused with 「video_id list len over limit:20」. Fifteen is the size that
+         * fits, and it is what turns one registration per episode into one registration per
+         * fifteen episodes.
+         */
+        const val PLAYBACK_BATCH_SIZE = 15
+        /**
+         * The device level the playback request declares.
+         *
+         * This is the knob that decides which codec the site hands over. Measured 2026-11-05 on
+         * 《悍妇边军》第一季, fifteen episodes asked for at once:
+         *
+         *  - level 3 (what this client used to declare): six episodes came back with ByteVC1,
+         *    nine with ByteVC2. The bytes behind the ByteVC2 addresses really are `bvc2` - the
+         *    container says so - and no television can decode that.
+         *  - level 0 and level 1: all fifteen came back with ByteVC1, and the bytes behind those
+         *    addresses are `hvc1`, which is HEVC - the format a television does decode.
+         *
+         * So the nine episodes that could not be played were not a broken window: the request
+         * was asking for the codec the site reserves for devices that can decode ByteVC2.
+         * Level 1 is declared because it answers the same as level 0 - ByteVC1 - and 1 is the
+         * level measured together with level 0 on the same episode.
+         */
+        const val PLAYBACK_DEVICE_LEVEL = 1
+        /** How long an address stays usable. */
+        const val ADDRESS_CACHE_TTL_MS = 2*60*60*1000L
+        /** How many addresses are kept at once. */
+        const val ADDRESS_CACHE_MAX = 120
+        /**
+         * How long one device registration may take.
+         *
+         * It is a request the whole playback path depends on, and it happens once per session,
+         * so it can afford to wait longer than an address lookup: the lookup's ten seconds were
+         * measured against a stall of 10.04 s whose answer arrived 155 ms late - the request
+         * was killed a moment before it would have succeeded, and the box was left without an
+         * identity for the whole retry window.
+         */
+        const val REGISTRATION_CALL_TIMEOUT_S = 20L
+        /**
+         * The device parameters the playback request carries beside the registered identity.
+         *
+         * They are written in the order the app writes them, and they are written the way the
+         * app writes them: `resolution` is the only value that is not a plain word, and the app
+         * percent-encodes its `*` rather than leaving it as it is.
+         */
+        val PLAYBACK_DEVICE_PARAMS: Map<String, String> = linkedMapOf(
+            "ac" to "wifi", "channel" to "update_64", "aid" to "8662", "app_name" to "novelread",
+            "version_code" to "71332", "version_name" to "7.1.3.32", "device_platform" to "android",
+            "os" to "android", "ssmix" to "a", "device_type" to "25053RT47C", "device_brand" to "Redmi",
+            "language" to "zh", "os_api" to "36", "os_version" to "16", "manifest_version_code" to "71332",
+            "resolution" to "1280*2772", "dpi" to "520", "update_version_code" to "71332",
+            "host_abi" to "arm64-v8a", "dragon_device_type" to "phone", "pv_player" to "71332",
+            "compliance_status" to "0", "need_personal_recommend" to "1", "player_so_load" to "1",
+            "is_android_pad_screen" to "0"
+        )
+        /**
+         * 取址这条 GET 用的客户端版本（73932 / 7.3.9.32）。
+         *
+         * 与注册 body 里的版本资料一致：站方 App 自己这条取址路就是这么发的，
+         * UA、query 里的版本字段、注册 body 三处必须说同一个版本。
+         * 下面那份 [PLAYBACK_DEVICE_PARAMS]（71332 / 7.1.3.32）是老 POST 门用的，两条路不能混用。
+         */
+        val VIDEO_TAB_DEVICE_PARAMS: Map<String, String> = linkedMapOf(
+            "ac" to "wifi", "channel" to "update_64", "aid" to "8662", "app_name" to "novelread",
+            "version_code" to "73932", "version_name" to "7.3.9.32", "device_platform" to "android",
+            "os" to "android", "ssmix" to "a", "device_type" to "25053RT47C", "device_brand" to "Redmi",
+            "language" to "zh", "os_api" to "36", "os_version" to "16", "manifest_version_code" to "73932",
+            "resolution" to "1280*2772", "dpi" to "520", "update_version_code" to "73932",
+            "host_abi" to "arm64-v8a", "dragon_device_type" to "phone", "pv_player" to "73932",
+            "compliance_status" to "0", "need_personal_recommend" to "1", "player_so_load" to "1",
+            "is_android_pad_screen" to "0"
+        )
+        /**
+         * 取址这条 GET 戴的 UA：视频 UA，把客户端版本换成 73932。
+         */
+        const val PLAYBACK_TAB_UA = "com.phoenix.read/73932 (Linux; U; Android 16; zh_CN; 25053RT47C; Build/BP2A.250605.031.A3; Cronet/TTNetVersion:04657795 2026-01-23 QuicVersion:c67e9834 2025-09-08)"
+        /**
+         * Percent-encoding for the playback query.
+         *
+         * 站方 App 自己的编码规则：`encodeURIComponent` 的语义，再把 `!'()` 显式转成 %XX。
+         * 与 `encodeURIComponent` 只差一处：`*` **不转义** ——
+         * `resolution=1280*2772` 里的星号原样留在 query 上。
+         *
+         * 签名是按 query 的字节算的，多编一个字符，服务端算出来的摘要就对不上，
+         * 表现是 HTTP 200 + 0 字节，连错误码都没有。所以这里只能照抄，不能「顺手更严」。
+         */
+        fun playbackEncode(value: String): String {
+            val out=StringBuilder()
+            for(byte in value.toByteArray(Charsets.UTF_8)) {
+                val v=byte.toInt() and 255
+                if(v in 65..90 || v in 97..122 || v in 48..57 || v==45 || v==95 || v==46 || v==126 || v==42) out.append(v.toChar())
+                else out.append('%').append("%02X".format(v))
+            }
+            return out.toString()
+        }
+        /** How long a connection to the site or the CDN may take. */
+        const val CONNECT_TIMEOUT_S = 15L
+        /** How long a single socket may sit without data. */
+        const val READ_TIMEOUT_S = 30L
+        /** How long one request may take from start to finish. */
+        const val CALL_TIMEOUT_S = 45L
+        /**
+         * The transport every stream of this app uses.
+         *
+         * The client that prepares the next episode is the client that plays it afterwards, so
+         * this carries the timeouts a whole download needs. The player pulls the video in 512 KiB
+         * ranges and each of those is one call that has to finish inside [CALL_TIMEOUT_S]; a
+         * timeout short enough for a preparation would be short enough to fail a slow chunk of
+         * the episode it prepared.
+         *
+         * A preparation has its own deadline instead - see [PrefetchPolicy.BUDGET_MS] - which is
+         * what keeps a stalled preparation from holding the uplink.
+         */
+        fun playbackHttpClient(): OkHttpClient = OkHttpClient.Builder()
+            .connectTimeout(CONNECT_TIMEOUT_S,TimeUnit.SECONDS)
+            .readTimeout(READ_TIMEOUT_S,TimeUnit.SECONDS)
+            .callTimeout(CALL_TIMEOUT_S,TimeUnit.SECONDS)
+            // The address order decides which path the box takes: IPv4 first, IPv6 still there.
+            .dns(PreferIpv4Dns())
+            .build()
+        /**
+         * How long one route of the address lookup may take.
+         *
+         * The player is a box in the living room, and the person is looking at 「正在获取播放地址…」.
+         * The retry counter does not start until this call comes back, so every second spent
+         * here is a second before the first retry. A dropped handshake used to sit there for the
+         * whole 15-second connect timeout of the video transport - a transport that has to carry
+         * 512 KiB chunks of a whole episode, and therefore cannot be tightened. An address lookup
+         * is one small JSON, so it gets its own, much shorter leash.
+         */
+        const val ADDRESS_CONNECT_TIMEOUT_S = 5L
+        /**
+         * How long one address lookup may take from start to finish.
+         *
+         * This is the number the person actually waits, so this is the one that has to be small.
+         * It bounds the whole lookup - every route, the DNS, the handshake and the response -
+         * because it is the call timeout, not the connect timeout, that ends the call.
+         */
+        const val ADDRESS_CALL_TIMEOUT_S = 10L
+        /**
+         * The transport one playback attempt's address lookup uses.
+         *
+         * Derived from the transport it is given, so an injected client and its interceptors
+         * still apply - only the deadlines change.
+         *
+         * OkHttp's own retry stays on. These hosts resolve to several addresses and not all of
+         * them answer - measured on the phone: the same name came back as a working address and
+         * as a black hole within a minute. One dead address must not kill the lookup, or the
+         * episode stops playing for a reason nobody can see. The wait is bounded by
+         * [ADDRESS_CALL_TIMEOUT_S] instead, which is the only bound the person watching the
+         * screen can feel.
+         */
+        fun addressHttpClient(base: OkHttpClient = playbackHttpClient()): OkHttpClient = base.newBuilder()
+            .connectTimeout(ADDRESS_CONNECT_TIMEOUT_S,TimeUnit.SECONDS)
+            .callTimeout(ADDRESS_CALL_TIMEOUT_S,TimeUnit.SECONDS)
+            .build()
+        /** One screen of search results, matching the 30 rows the list renders. */
+        const val SEARCH_PAGE_SIZE = 30
+        /**
+         * The most characters the site's search endpoint takes.
+         *
+         * Measured 2026-10-23 against the live endpoint: a longer query comes back
+         * `400 {"code":"invalid_query","message":"Provide one non-empty search query of at most
+         * 30 characters."}` - a refusal, not a failure, and it does not go away by waiting. So a
+         * long word has to be cut before it is sent, and the cut has to be disclosed: the user
+         * typed forty characters and the site was asked about thirty of them.
+         */
+        const val SITE_QUERY_LIMIT = 30
+        /**
+         * How many local matches a search keeps.
+         *
+         * The site carries 2400 shows, so this is a ceiling no index can reach; it is here so a
+         * future one cannot make a keystroke hand back an unbounded list.
+         *
+         * It does **not** bound the work: [CatalogueIndex.search] sorts every match before it
+         * takes any of them, so a smaller cap cost exactly the same time and did one thing
+         * besides — it hid the rest of the library. The page counter and the 「共 N 部」 line
+         * were then computed from what was left, so both under-reported and the pages past the
+         * cap came up empty for a search that plainly had more.
+         */
+        const val SEARCH_LOCAL_LIMIT = 5000
+        fun extractRouter(html: String): JSONObject {
+            val marker=html.indexOf("_ROUTER_DATA"); if(marker<0) throw IOException("页面没有内容数据")
+            val first=html.indexOf('{',marker); if(first<0) throw IOException("页面数据格式错误")
+            var depth=0; var quoted=false; var escaped=false
+            for(i in first until html.length) {
+                val ch=html[i]
+                if(quoted) { if(escaped) escaped=false else if(ch=='\\') escaped=true else if(ch=='"') quoted=false; continue }
+                when(ch) { '"' -> quoted=true; '{','[' -> depth++; '}',']' -> { depth--; if(depth==0) return JSONObject(html.substring(first,i+1)) } }
+            }
+            throw IOException("页面数据不完整")
+        }
+        fun qualityNumber(value: String): Int = Regex("2160|1440|1080|720|576|540|480|360").find(value)?.value?.toInt() ?: mapOf("1920" to 1080,"1280" to 720,"1024" to 576,"854" to 480,"640" to 360)[value] ?: value.toIntOrNull() ?: 0
+    }
+}

@@ -1,0 +1,68 @@
+// SPDX-License-Identifier: GPL-3.0-only
+package com.hongguotv.core
+
+import okhttp3.Call
+import okhttp3.Response
+import java.io.IOException
+
+/**
+ * The work was called off on purpose.
+ *
+ * It is its own kind of failure: the site and the network are both fine, the person just went
+ * somewhere else. Code that would otherwise retry or fall back has to be able to tell this
+ * apart from a real error - see [isCancellation].
+ */
+class CancelledException(message: String = "请求已取消") : IOException(message)
+
+/** Cancels only the work owned by one navigation/playback intent, including body reads. */
+class RequestScope {
+    private var cancelled = false
+    private val calls = mutableSetOf<Call>()
+
+    @Synchronized fun cancel() {
+        cancelled = true
+        calls.forEach { it.cancel() }
+        calls.clear()
+    }
+
+    @Synchronized private fun attach(call: Call) {
+        if (cancelled || Thread.currentThread().isInterrupted) {
+            call.cancel()
+            throw CancelledException()
+        }
+        calls += call
+    }
+
+    @Synchronized private fun detach(call: Call) { calls -= call }
+
+    fun <T> run(action: () -> T): T {
+        val previous = current.get()
+        current.set(this)
+        try {
+            synchronized(this) { if (cancelled) throw CancelledException() }
+            return action()
+        } finally {
+            if (previous == null) current.remove() else current.set(previous)
+        }
+    }
+
+    companion object {
+        private val current = ThreadLocal<RequestScope>()
+        /**
+         * The scope that owns the calling thread.
+         *
+         * Work that is handed to another thread has to carry the scope with it, or the scope
+         * cannot cancel it any more: [current] is a thread local, and a thread that never set
+         * it has no scope to cancel. The playback address lookup fires a wave of requests at
+         * the same time and runs them on other threads, so it takes the owner here and
+         * re-establishes it on each of them.
+         */
+        fun owner(): RequestScope? = current.get()
+        fun <T> execute(call: Call, consume: (Response) -> T): T {
+            val owner = current.get()
+            owner?.attach(call)
+            try { return call.execute().use(consume) }
+            finally { owner?.detach(call) }
+        }
+    }
+}

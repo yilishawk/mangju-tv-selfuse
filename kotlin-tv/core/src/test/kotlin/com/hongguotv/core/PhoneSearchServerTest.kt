@@ -1,0 +1,136 @@
+package com.hongguotv.core
+
+import org.junit.Assert.*
+import org.junit.Test
+import java.net.Socket
+import java.net.URI
+import java.net.URLEncoder
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+
+class PhoneSearchServerTest {
+    private fun request(server: PhoneSearchServer,method: String="GET",path: String?=null,body: String="",headers: String="",host: String?=null): String {
+        val uri=URI(server.url)
+        return Socket("127.0.0.1",uri.port).use { socket ->
+            socket.soTimeout=3000
+            val bytes=body.toByteArray(Charsets.UTF_8)
+            socket.getOutputStream().write(("$method ${path ?: uri.path} HTTP/1.1\r\nHost: ${host ?: uri.authority}\r\n"+headers+if(method=="POST") "Content-Type: application/x-www-form-urlencoded\r\nContent-Length: ${bytes.size}\r\n\r\n" else "\r\n").toByteArray()+bytes)
+            socket.getInputStream().readBytes().toString(Charsets.UTF_8)
+        }
+    }
+    @Test fun `phone form accepts one unicode search without reflecting it in HTML`() {
+        val received=CountDownLatch(1); var query=""
+        PhoneSearchServer("127.0.0.1",{ query=it;received.countDown() }).use { server ->
+            val page=request(server)
+            assertTrue(page.startsWith("HTTP/1.1 200")); assertTrue(page.contains("Cache-Control: no-store")); assertTrue(page.contains("form-action 'self'"))
+            val value="测试 <script>alert(1)</script>"
+            val reply=request(server,"POST",URI(server.url).path+"/submit","query="+URLEncoder.encode(value,"UTF-8"))
+            assertTrue(reply.startsWith("HTTP/1.1 200")); assertFalse(reply.contains(value))
+            assertTrue(received.await(2,TimeUnit.SECONDS)); assertEquals(value,query)
+            assertTrue(runCatching { request(server) }.isFailure)
+        }
+    }
+    @Test fun `wrong token host and cross site posts cannot submit`() {
+        var submitted=false
+        PhoneSearchServer("127.0.0.1",{ submitted=true }).use { server ->
+            assertTrue(request(server,path="/wrong").startsWith("HTTP/1.1 404"))
+            assertTrue(request(server,host="evil.example").startsWith("HTTP/1.1 404"))
+            assertTrue(request(server,"POST",URI(server.url).path+"/submit","query=test","Origin: http://evil.example\r\n").startsWith("HTTP/1.1 403"))
+            assertFalse(submitted)
+        }
+    }
+    @Test fun `a browser that cannot name the origin still submits the search`() {
+        // Chromium turns the Origin into "null" for a form POST under
+        // "Referrer-Policy: no-referrer", so the phone used to get "来源不匹配" for a
+        // search it had typed correctly. A null origin is not proof of a cross-site
+        // request: the one-shot token in the URL is the secret.
+        val received=CountDownLatch(1); var query=""
+        PhoneSearchServer("127.0.0.1",{ query=it;received.countDown() }).use { server ->
+            val reply=request(server,"POST",URI(server.url).path+"/submit","query="+URLEncoder.encode("剧名","UTF-8"),"Origin: null\r\n")
+            assertTrue(reply,reply.startsWith("HTTP/1.1 200"))
+            assertTrue(received.await(2,TimeUnit.SECONDS)); assertEquals("剧名",query)
+        }
+    }
+    @Test fun `a request the browser calls cross site is refused even without an origin`() {
+        var submitted=false
+        PhoneSearchServer("127.0.0.1",{ submitted=true }).use { server ->
+            assertTrue(request(server,"POST",URI(server.url).path+"/submit","query=test","Origin: null\r\nSec-Fetch-Site: cross-site\r\n").startsWith("HTTP/1.1 403"))
+            assertFalse(submitted)
+        }
+    }
+    @Test fun `the page asks the phone for a text keyboard and leaves the empty check to the server`() {
+        // 手机上「打字有问题」的一半在这一页：浏览器要弹的是文字键盘（inputmode），
+        // 焦点要自己落在输入框上（autofocus）；空提交不能被浏览器原生气泡拦下来，
+        // 那种气泡不告诉用户「字没进去」，只会让人以为页面坏了。
+        PhoneSearchServer("127.0.0.1",{}).use { server ->
+            val page=request(server)
+            assertTrue(page.contains("inputmode=\"text\""))
+            assertTrue(page.contains("autofocus"))
+            assertFalse(page.contains("required"))
+        }
+    }
+    @Test fun `the page does not ask the browser to hide the origin`() {
+        // "no-referrer" is what makes Chromium answer a form POST with Origin: null.
+        PhoneSearchServer("127.0.0.1",{}).use { server ->
+            val page=request(server)
+            assertTrue(page.contains("Referrer-Policy: same-origin"))
+            assertFalse(page.contains("Referrer-Policy: no-referrer"))
+        }
+    }
+    @Test fun `invalid and oversized input does not consume the session`() {
+        PhoneSearchServer("127.0.0.1",{}).use { server ->
+            for(body in listOf("query=","query="+"x".repeat(81),"query=a&query=b","query=hello%0Aworld","query=%zz")) {
+                val response=request(server,"POST",URI(server.url).path+"/submit",body)
+                assertTrue(response,response.startsWith("HTTP/1.1 400"))
+            }
+            assertTrue(request(server,"POST",URI(server.url).path+"/submit","query="+"x".repeat(4096)).startsWith("HTTP/1.1 413"))
+            assertTrue(request(server).startsWith("HTTP/1.1 200"))
+        }
+    }
+    @Test fun `a closed session is unreachable`() {
+        val closed=PhoneSearchServer("127.0.0.1",{}); closed.close()
+        assertTrue(runCatching { request(closed) }.isFailure)
+    }
+    @Test fun `an expired session answers with a Chinese hint instead of a dead port`() {
+        // 端口一关，手机浏览器只能对着一个没人监听的地址转圈到超时，用户什么线索都拿不到。
+        // 会话过期之后端口还要留一段时间：回一句「二维码已失效」，用户才知道该回电视重开。
+        val expired=CountDownLatch(1)
+        PhoneSearchServer("127.0.0.1",{ fail("expired session submitted") },{ expired.countDown() },1).use { server ->
+            assertTrue(expired.await(2,TimeUnit.SECONDS))
+            val reply=request(server)
+            assertTrue(reply,reply.startsWith("HTTP/1.1 410"))
+            assertTrue(reply.contains("二维码已失效"))
+            val post=request(server,"POST",URI(server.url).path+"/submit","query=x")
+            assertTrue(post,post.startsWith("HTTP/1.1 410"))
+        }
+    }
+    @Test fun `a session lasts half an hour by default`() {
+        // 5 分钟太短：扫完码、掏手机、开浏览器、输完剧名，常常正好踩在过期点上。
+        assertEquals(1_800_000L,PhoneSearchServer.DEFAULT_TTL_MILLIS)
+        assertTrue(PhoneSearchServer.GRACE_MILLIS>0)
+    }
+    @Test fun `the status line carries a standard reason phrase`() {
+        // 状态行以前是 "HTTP/1.1 200 Response" —— "Response" 不是标准原因短语。
+        // curl 和 HttpURLConnection 都不在乎，但 iOS 的 CFNetwork 可能直接拒收，
+        // 表现就是「手机上打不开这个网页」，而且没有任何提示。
+        PhoneSearchServer("127.0.0.1",{}).use { server ->
+            val page=request(server)
+            assertTrue(page,page.startsWith("HTTP/1.1 200 OK"))
+            assertFalse(page.contains("HTTP/1.1 200 Response"))
+            assertTrue(request(server,path="/wrong").startsWith("HTTP/1.1 404 Not Found"))
+        }
+    }
+    @Test fun `the response carries a Date header like every http origin server must`(){
+        // 这一条是 iPhone 打不开那个网页的真正原因（2026-11-07 实测）。
+        // 对照实验：在 PC 上起两个只差 Date 头的服务，响应头其余部分完全一样，
+        // iPhone 上一个能打开、一个打不开 —— 缺 Date 的那个直接判成非法响应。
+        // RFC 7231 也写了：origin server 必须发 Date。
+        PhoneSearchServer("127.0.0.1",{}).use { server ->
+            val page=request(server)
+            val date=page.lines().firstOrNull { it.startsWith("Date: ") }
+            assertNotNull("响应里没有 Date 头",date)
+            // IMF-fixdate：Sat, 07 Nov 2026 12:44:29 GMT（日子要补零）
+            assertTrue(date!!,Regex("^Date: [A-Z][a-z]{2}, \\d{2} [A-Z][a-z]{2} \\d{4} \\d{2}:\\d{2}:\\d{2} GMT$").matches(date))
+        }
+    }
+}
