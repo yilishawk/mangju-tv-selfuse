@@ -16,9 +16,10 @@ data class AppUpdate(val versionCode: Long, val versionName: String, val minSdk:
     fun newerThan(installed: Long, sdk: Int) = versionCode > installed && minSdk <= sdk
     val downloadUrl get() = "$RELEASES/download/$tag/$fileName"
     companion object {
-        // 指向本仓库自己的 release。上游 N3urda/hongguoTV-updates 从未发布过任何版本，
-        // 留在这里会让「检查更新」永远 404，电视拿不到新版。
-        const val REPOSITORY = "miaoxiaohu/hongguoTV"
+        // 指向真正发布 APK 的仓库。上游 miaoxiaohu/hongguoTV 只有源码，从不挂 APK，
+        // 指过去会让「检查更新」拿到 404 或别人的版本；本仓库的 release.yml 才会产出
+        // update.json 与 android6 安装包。
+        const val REPOSITORY = "yilishawk/mangju-tv-selfuse"
         const val RELEASES = "https://github.com/$REPOSITORY/releases"
         const val MAX_APK_BYTES = 80L * 1024 * 1024
         fun parse(json: String): AppUpdate {
@@ -30,7 +31,7 @@ data class AppUpdate(val versionCode: Long, val versionName: String, val minSdk:
             require(update.versionCode in 1..Int.MAX_VALUE.toLong() && update.minSdk in 26..100)
             require(update.versionName.matches(Regex("[0-9][0-9A-Za-z.+-]{0,63}")))
             require(update.tag.matches(Regex("kotlin-v[0-9][0-9A-Za-z.+-]{0,80}")))
-            require(update.fileName.matches(Regex("hongguotv-kotlin-[0-9][0-9A-Za-z.+-]{0,80}-android8\\.apk")))
+            require(update.fileName.matches(Regex("hongguotv-kotlin-[0-9][0-9A-Za-z.+-]{0,80}-android6\\.apk")))
             require(update.size in 1..MAX_APK_BYTES && update.sha256.matches(Regex("[0-9a-f]{64}")))
             return update
         }

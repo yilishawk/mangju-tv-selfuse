@@ -179,8 +179,14 @@ class AppUpdater(private val activity: Activity, private val idle: () -> Boolean
         val version = if (Build.VERSION.SDK_INT >= 28) candidate.longVersionCode else candidate.versionCode.toLong()
         fun signers(info: android.content.pm.PackageInfo) =
             (if (Build.VERSION.SDK_INT >= 28) info.signingInfo?.apkContentsSigners else info.signatures)?.map { it.toCharsString() }?.toSet().orEmpty()
+        // ApplicationInfo.minSdkVersion is API 24. On Android 6/7 the field does not exist, so
+        // reading it throws NoSuchFieldError; there is no older way to ask the package parser for
+        // it. The manifest's minSdk is therefore only compared where it can be read - the
+        // installer enforces it on every version anyway, and a package built below the device's
+        // API level is rejected there rather than silently installed.
+        val candidateMinSdk = if (Build.VERSION.SDK_INT >= 24) candidate.applicationInfo?.minSdkVersion else null
         if (candidate.packageName != activity.packageName || version != update.versionCode || candidate.versionName != update.versionName || version <= BuildConfig.VERSION_CODE ||
-            candidate.applicationInfo?.minSdkVersion != update.minSdk || signers(installed).isEmpty() || signers(installed) != signers(candidate))
+            (candidateMinSdk != null && candidateMinSdk != update.minSdk) || signers(installed).isEmpty() || signers(installed) != signers(candidate))
             throw IOException("新版包名、版本或签名不匹配，已阻止安装")
     }
     /**

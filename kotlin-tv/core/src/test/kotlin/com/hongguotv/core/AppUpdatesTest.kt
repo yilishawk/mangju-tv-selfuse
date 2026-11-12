@@ -14,7 +14,7 @@ class AppUpdatesTest {
     private val bytes = "signed-apk-test-bytes".toByteArray()
     private fun json() = JSONObject().put("schema", 1).put("packageName", "com.hongguotv.nativeapp")
         .put("versionCode", 10001).put("versionName", "0.9.0+1").put("minSdk", 26).put("tag", "kotlin-v0.9.0-build.1")
-        .put("apk", JSONObject().put("name", "hongguotv-kotlin-0.9.0-build.1-android8.apk").put("size", bytes.size)
+        .put("apk", JSONObject().put("name", "hongguotv-kotlin-0.9.0-build.1-android6.apk").put("size", bytes.size)
             .put("sha256", MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }))
     private fun update() = AppUpdate.parse(json().toString())
     private fun withFile(block: (File) -> Unit) {
@@ -26,8 +26,8 @@ class AppUpdatesTest {
         assertTrue(update.newerThan(9, 26)); assertFalse(update.newerThan(10001, 36)); assertFalse(update.newerThan(10002, 36)); assertFalse(update.newerThan(9, 25))
     }
     @Test fun downloadUrlUsesOnlyFixedRepositoryAndValidatedNames() {
-        assertEquals("https://github.com/miaoxiaohu/hongguoTV/releases/download/kotlin-v0.9.0-build.1/hongguotv-kotlin-0.9.0-build.1-android8.apk", update().downloadUrl)
-        for (value in listOf("../../bad.apk", "evil.apk", "https://example.com/evil.apk", "hongguotv-kotlin-1/2-android8.apk")) {
+        assertEquals("https://github.com/yilishawk/mangju-tv-selfuse/releases/download/kotlin-v0.9.0-build.1/hongguotv-kotlin-0.9.0-build.1-android6.apk", update().downloadUrl)
+        for (value in listOf("../../bad.apk", "evil.apk", "https://example.com/evil.apk", "hongguotv-kotlin-1/2-android6.apk")) {
             val o = json(); o.getJSONObject("apk").put("name", value)
             assertThrows(IllegalArgumentException::class.java) { AppUpdate.parse(o.toString()) }
         }
@@ -65,7 +65,7 @@ class AppUpdatesTest {
     @Test fun shippedManifestShapePassesTheRealValidator() {
         val fixture = """{"schema":1,"packageName":"com.hongguotv.nativeapp","versionCode":9014,"versionName":"0.9.14",
             "minSdk":26,"tag":"kotlin-v0.9.14","notes":"首页片库扩为三个分类。","sourceCommit":"0000000000000000000000000000000000000000",
-            "apk":{"name":"hongguotv-kotlin-0.9.14-android8.apk","size":2685970,
+            "apk":{"name":"hongguotv-kotlin-0.9.14-android6.apk","size":2685970,
             "sha256":"d5e52fe87422afca0257ab313fe18f39b770d7de22d1d13ca268630ef35b56d0"}}"""
         assertValidManifest(fixture, "生成器契约样例")
     }
@@ -81,10 +81,10 @@ class AppUpdatesTest {
         assertValidManifest(file.readText(), file.path)
     }
     @Test fun theRepositoryIsThisProjectNotTheUnusedUpstream() {
-        // 上游 N3urda/hongguoTV-updates 从未发布过任何 release，指向它会让检查更新永远 404。
-        assertEquals("miaoxiaohu/hongguoTV", AppUpdate.REPOSITORY)
-        assertTrue(AppUpdate.RELEASES.startsWith("https://github.com/miaoxiaohu/hongguoTV/"))
-        assertEquals("https://github.com/miaoxiaohu/hongguoTV/releases/latest/download/update.json",
+        // 上游 miaoxiaohu/hongguoTV 只有源码、不挂 APK；只有本仓库的 release 才有 update.json。
+        assertEquals("yilishawk/mangju-tv-selfuse", AppUpdate.REPOSITORY)
+        assertTrue(AppUpdate.RELEASES.startsWith("https://github.com/yilishawk/mangju-tv-selfuse/"))
+        assertEquals("https://github.com/yilishawk/mangju-tv-selfuse/releases/latest/download/update.json",
             "${AppUpdate.RELEASES}/latest/download/update.json")
     }
     @Test fun rejectOtherPackageAndInvalidSchema() {
