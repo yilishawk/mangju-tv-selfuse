@@ -3,6 +3,7 @@ package com.hongguotv.nativeapp
 
 import android.app.Activity
 import android.app.AlertDialog
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -15,6 +16,7 @@ import android.content.Context
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.widget.*
 import android.text.TextUtils
 import androidx.media3.common.*
@@ -387,7 +389,14 @@ class MainActivity: Activity() {
         })
         updater=AppUpdater(this) { foreground && library.isLoaded && screen=="catalog" && !tvTools.showing }
         connectivity=getSystemService(ConnectivityManager::class.java)
-        runCatching { connectivity.registerDefaultNetworkCallback(networkCallback); networkRegistered=true }
+        // registerDefaultNetworkCallback 是 API 24，minSdk 是 23：低版本改用 API 21 就有的
+        // 显式请求重载。这里要的只是「默认的、能上外网的那条网络」，两种注册在这一点上等价。
+        runCatching {
+            if (Build.VERSION.SDK_INT >= 24) connectivity.registerDefaultNetworkCallback(networkCallback)
+            else connectivity.registerNetworkCallback(
+                NetworkRequest.Builder().addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET).build(), networkCallback)
+            networkRegistered=true
+        }
         favoriteMonitor=FavoriteMonitor(library,repository) { refreshFavoriteLabels() }
         mediaSession=TvMediaSession(this,{ if(foreground && screen=="player") requestPlayback(true) },{ if(foreground && screen=="player") requestPlayback(false) },{ position -> if(foreground && screen=="player") seekTo(position) },{ direction -> skipEpisode(direction) },{ if(foreground && screen=="player") returnToDetail() })
         // 弹幕是锦上添花：拉不到就拉不到，绝不能打断播放，也不该在屏幕上留一条错误。
